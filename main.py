@@ -100,14 +100,9 @@ class ByBitDownloader:
         self.start_date = tk.StringVar()
         self.end_date = tk.StringVar()
         self.filter_text = tk.StringVar()
+        self.filter_category = tk.StringVar(value="Все")  # Фильтр по категории
         self.status_text = tk.StringVar(value="Готов к работе")
         self.progress_value = tk.DoubleVar()
-        
-        # Данные
-        self.tickers_data = []
-        self.marked_tickers = set()
-        self.download_thread = None
-        self.stop_download = False
         
         # Переменные для корректного завершения
         self.active_tasks = []
@@ -120,6 +115,15 @@ class ByBitDownloader:
         self.start_date.set(self.settings.get('Period', 'start_date', fallback=datetime.now().strftime("%Y-%m-%d %H:%M")))
         # end_date всегда устанавливаем на текущий момент при открытии программы
         self.end_date.set(datetime.now().strftime("%Y-%m-%d %H:%M"))
+        
+        # Данные
+        self.tickers_data = []
+        self.marked_tickers = set()
+        self.download_thread = None
+        self.stop_download = False
+        
+        # Состояние выделения
+        self.last_active_item = None  # Последний активный (выделенный) тикер
         
         self.setup_ui()
         self.load_marked_tickers()
@@ -166,9 +170,23 @@ class ByBitDownloader:
         filter_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
         filter_frame.columnconfigure(1, weight=1)
         
+        # Текстовый фильтр
         ttk.Label(filter_frame, text="Фильтр тикеров:").grid(row=0, column=0, padx=(0, 5))
-        ttk.Entry(filter_frame, textvariable=self.filter_text).grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
-        ttk.Button(filter_frame, text="Фильтр", command=self.apply_filter).grid(row=0, column=2, padx=(5, 0))
+        filter_entry = ttk.Entry(filter_frame, textvariable=self.filter_text)
+        filter_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=5)
+        filter_entry.bind("<KeyRelease>", lambda e: self.apply_filter())
+        
+        # Фильтр по категории
+        ttk.Label(filter_frame, text="Категория:").grid(row=0, column=2, padx=(10, 5))
+        category_combo = ttk.Combobox(filter_frame, textvariable=self.filter_category, 
+                                     values=["Все", "Спот", "Линейный", "Обратный"], 
+                                     state="readonly", width=10)
+        category_combo.grid(row=0, column=3, padx=5)
+        category_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_filter())
+        
+        # Кнопка фильтра
+        ttk.Button(filter_frame, text="Фильтр", command=self.apply_filter).grid(row=0, column=4, padx=(5, 0))
+        ttk.Button(filter_frame, text="Сбросить", command=self.reset_filters).grid(row=0, column=5, padx=(5, 0))
         
         # Таблица тикеров
         table_frame = ttk.Frame(main_frame)
@@ -176,17 +194,19 @@ class ByBitDownloader:
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         
-        # Создание таблицы - убираем лишнюю колонку
-        columns = ("ticker", "volume", "turnover", "change")
+        # Создание таблицы - добавляем колонку категории
+        columns = ("ticker", "category", "volume", "turnover", "change")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=15)
         
         # Настройка столбцов
         self.tree.heading("ticker", text="Тикер", command=lambda: self.sort_column("ticker"))
+        self.tree.heading("category", text="Категория", command=lambda: self.sort_column("category"))
         self.tree.heading("volume", text="Объем", command=lambda: self.sort_column("volume"))
         self.tree.heading("turnover", text="Оборот", command=lambda: self.sort_column("turnover"))
         self.tree.heading("change", text="Изменение", command=lambda: self.sort_column("change"))
         
         self.tree.column("ticker", width=100, anchor=tk.W)
+        self.tree.column("category", width=80, anchor=tk.CENTER)
         self.tree.column("volume", width=100, anchor=tk.E)
         self.tree.column("turnover", width=100, anchor=tk.E)
         self.tree.column("change", width=100, anchor=tk.E)
@@ -390,49 +410,69 @@ class ByBitDownloader:
             messagebox.showerror("Ошибка", error_msg)
     
     def get_tickers_from_bybit(self) -> List[Dict]:
-        """Получение списка тикеров с ByBit API"""
+        """Получение списка тикеров с ByBit API (спот + фьючерсы)"""
         try:
             import requests
             
             url = "https://api.bybit.com/v5/market/tickers"
-            params = {"category": "spot"}
+            all_tickers = []
             
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
+            # Категории для загрузки
+            categories = ["spot", "linear", "inverse"]
             
-            data = response.json()
-            
-            if data.get("retCode") != 0:
-                raise Exception(f"API ошибка: {data.get('retMsg', 'Неизвестная ошибка')}")
-            
-            result = data.get("result", {})
-            instruments = result.get("list", [])
-            
-            tickers = []
-            for instrument in instruments:
-                symbol = instrument.get("symbol")
-                if symbol:
-                    tickers.append({
-                        "symbol": symbol,
-                        "volume24h": float(instrument.get("volume24h", 0)),
-                        "turnover24h": float(instrument.get("turnover24h", 0)),
-                        "priceChangePercent": float(instrument.get("price24hPcnt", 0)) * 100
-                    })
+            for category in categories:
+                try:
+                    params = {"category": category}
+                    response = requests.get(url, params=params, timeout=30)
+                    response.raise_for_status()
+                    
+                    data = response.json()
+                    
+                    if data.get("retCode") != 0:
+                        logger.warning(f"API ошибка для категории {category}: {data.get('retMsg', 'Неизвестная ошибка')}")
+                        continue
+                    
+                    result = data.get("result", {})
+                    instruments = result.get("list", [])
+                    
+                    for instrument in instruments:
+                        symbol = instrument.get("symbol")
+                        if symbol:
+                            # Добавляем префикс категории для различения
+                            if category == "spot":
+                                display_symbol = symbol
+                            else:
+                                display_symbol = f"{symbol}_{category}"
+                            
+                            all_tickers.append({
+                                "symbol": display_symbol,
+                                "original_symbol": symbol,
+                                "category": category,
+                                "volume24h": float(instrument.get("volume24h", 0)),
+                                "turnover24h": float(instrument.get("turnover24h", 0)),
+                                "priceChangePercent": float(instrument.get("price24hPcnt", 0)) * 100
+                            })
+                    
+                    logger.info(f"Получено {len(instruments)} тикеров категории {category}")
+                    
+                except requests.exceptions.Timeout:
+                    logger.warning(f"Таймаут при получении тикеров категории {category}")
+                    continue
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Ошибка сети при получении тикеров категории {category}: {e}")
+                    continue
+                except Exception as e:
+                    logger.warning(f"Ошибка при получении тикеров категории {category}: {e}")
+                    continue
             
             # Сортировка по объему
-            tickers.sort(key=lambda x: x["volume24h"], reverse=True)
+            all_tickers.sort(key=lambda x: x["volume24h"], reverse=True)
             
-            logger.info(f"Получено {len(tickers)} тикеров с ByBit API")
-            return tickers
+            logger.info(f"Всего получено {len(all_tickers)} тикеров (спот + фьючерсы)")
+            return all_tickers
             
-        except requests.exceptions.Timeout:
-            logger.error("Таймаут при получении тикеров с ByBit API")
-            return []
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка сети при получении тикеров: {e}")
-            return []
         except Exception as e:
-            logger.error(f"Ошибка при получении тикеров: {e}")
+            logger.error(f"Критическая ошибка при получении тикеров: {e}")
             return []
     
     def update_tickers_table(self):
@@ -445,11 +485,22 @@ class ByBitDownloader:
             # Добавление данных
             for ticker in self.tickers_data:
                 symbol = ticker['symbol']
+                category = ticker['category']
                 volume = f"{int(ticker['volume24h']):,}".replace(",", " ")
                 turnover = f"{int(ticker['turnover24h']):,}".replace(",", " ")
                 change = f"{ticker['priceChangePercent']:.2f}%"
                 
-                item = self.tree.insert("", tk.END, values=(symbol, volume, turnover, change))
+                # Преобразование категории для отображения
+                if category == "spot":
+                    display_category = "Спот"
+                elif category == "linear":
+                    display_category = "Линейный"
+                elif category == "inverse":
+                    display_category = "Обратный"
+                else:
+                    display_category = category
+                
+                item = self.tree.insert("", tk.END, values=(symbol, display_category, volume, turnover, change))
                 
                 # Применяем пометки
                 if symbol in self.marked_tickers:
@@ -457,6 +508,10 @@ class ByBitDownloader:
             
             # Первичная сортировка по обороту в обратном порядке
             self.sort_column_initial("turnover")
+            
+            # Применяем фильтры если они установлены
+            if self.filter_text.get().strip() or self.filter_category.get() != "Все":
+                self.apply_filter()
             
             # Обновляем счетчик
             self.update_marked_count_status()
@@ -468,23 +523,39 @@ class ByBitDownloader:
         """Применение фильтра к таблице"""
         try:
             filter_text = self.filter_text.get().strip().upper()
+            filter_category = self.filter_category.get()
             
             # Показываем/скрываем строки
             for item in self.tree.get_children():
-                symbol = self.tree.item(item, "values")[0]
-                if filter_text in symbol:
+                values = self.tree.item(item, "values")
+                symbol = values[0]
+                category = values[1]
+                
+                # Проверяем текстовый фильтр
+                text_match = not filter_text or filter_text in symbol
+                
+                # Проверяем фильтр по категории
+                category_match = filter_category == "Все" or category == filter_category
+                
+                # Показываем строку только если оба фильтра пройдены
+                if text_match and category_match:
                     self.tree.reattach(item, "", "end")
                 else:
                     self.tree.detach(item)
             
             # Обновляем счетчик
             self.update_marked_count_status()
+            logger.info(f"Применен фильтр: текст='{filter_text}', категория='{filter_category}'")
         except Exception as e:
             logger.error(f"Ошибка при применении фильтра: {e}")
     
     def sort_column_initial(self, column):
         """Первичная сортировка таблицы по колонке (без учета предыдущего состояния)"""
         try:
+            # Сбрасываем состояние Shift+выделения
+            self.is_shift_selecting = False
+            self.shift_click_start = None
+            
             # Получаем текущие данные
             data = []
             for item in self.tree.get_children():
@@ -492,7 +563,7 @@ class ByBitDownloader:
                 data.append(values)
             
             # Определяем индекс колонки
-            column_index = {"ticker": 0, "volume": 1, "turnover": 2, "change": 3}.get(column, 0)
+            column_index = {"ticker": 0, "category": 1, "volume": 2, "turnover": 3, "change": 4}.get(column, 0)
             
             # Первичная сортировка всегда в обратном порядке
             reverse = True
@@ -530,6 +601,10 @@ class ByBitDownloader:
     def sort_column(self, column):
         """Сортировка таблицы по колонке"""
         try:
+            # Сбрасываем состояние Shift+выделения
+            self.is_shift_selecting = False
+            self.shift_click_start = None
+            
             # Получаем текущие данные
             data = []
             for item in self.tree.get_children():
@@ -537,7 +612,7 @@ class ByBitDownloader:
                 data.append(values)
             
             # Определяем индекс колонки - используем названия колонок из заголовков
-            column_index = {"ticker": 0, "volume": 1, "turnover": 2, "change": 3}.get(column, 0)
+            column_index = {"ticker": 0, "category": 1, "volume": 2, "turnover": 3, "change": 4}.get(column, 0)
             
             # Определяем порядок сортировки
             if not hasattr(self, '_sort_reverse'):
@@ -592,6 +667,9 @@ class ByBitDownloader:
                 # Обновляем выделение в таблице
                 self.tree.selection_set(item)
                 
+                # Обновляем последний активный тикер
+                self.last_active_item = item
+                
                 # Обновляем счетчик
                 self.update_marked_count_status()
         except Exception as e:
@@ -607,13 +685,23 @@ class ByBitDownloader:
                 # Переключаем пометку только для выбранного тикера
                 if symbol in self.marked_tickers:
                     self.marked_tickers.remove(symbol)
-                    self.tree.selection_remove(item)
                 else:
                     self.marked_tickers.add(symbol)
-                    self.tree.selection_add(item)
                 
-                # Обновляем счетчик
-                self.update_marked_count_status()
+                # Обновляем последний активный тикер
+                self.last_active_item = item
+                
+                # Синхронизируем визуальное выделение со всеми помеченными тикерами
+                self.update_table_selection()
+                
+                # Принудительно обновляем UI
+                self.root.update_idletasks()
+                
+                # Отложенно обновляем визуальное выделение через 10мс
+                self.root.after(10, self.update_table_selection)
+                
+                # Отложенно обновляем счетчик через 20мс
+                self.root.after(20, self.update_marked_count_status)
         except Exception as e:
             logger.error(f"Ошибка при обработке Ctrl+клика по таблице: {e}")
 
@@ -624,32 +712,128 @@ class ByBitDownloader:
             if item:
                 symbol = self.tree.item(item, "values")[0]
                 
-                # Добавляем тикер к существующим пометкам
-                self.marked_tickers.add(symbol)
-                self.tree.selection_add(item)
+                # Если есть последний активный тикер, выделяем диапазон от него до текущего
+                if self.last_active_item and self.last_active_item != item:
+                    self.select_range(self.last_active_item, item)
+                else:
+                    # Если нет последнего активного тикера, просто добавляем текущий
+                    self.marked_tickers.add(symbol)
+                    self.tree.selection_add(item)
                 
-                # Обновляем счетчик
-                self.update_marked_count_status()
+                # Обновляем последний активный тикер
+                self.last_active_item = item
+                
         except Exception as e:
             logger.error(f"Ошибка при обработке Shift+клика по таблице: {e}")
+    
+    def select_range(self, start_item, end_item):
+        """Выделение диапазона от start_item до end_item"""
+        try:
+            # Получаем все элементы таблицы
+            all_items = self.tree.get_children()
+            logger.debug(f"select_range: всего элементов в таблице: {len(all_items)}")
+            
+            # Проверяем, что start_item и end_item действительно существуют в all_items
+            if start_item not in all_items:
+                logger.error(f"ОШИБКА: start_item {start_item} не найден в all_items")
+                return
+            if end_item not in all_items:
+                logger.error(f"ОШИБКА: end_item {end_item} не найден в all_items")
+                return
+            
+            logger.debug(f"start_item и end_item найдены в all_items")
+            
+            # Находим индексы начального и конечного элементов
+            start_index = -1
+            end_index = -1
+            
+            logger.debug(f"Ищем start_item={start_item}, end_item={end_item}")
+            
+            for i, item in enumerate(all_items):
+                if item == start_item:
+                    start_index = i
+                    logger.debug(f"Найден start_index={i}")
+                if item == end_item:
+                    end_index = i
+                    logger.debug(f"Найден end_index={i}")
+                if start_index != -1 and end_index != -1:
+                    break
+            
+            if start_index == -1 or end_index == -1:
+                logger.warning(f"Не найдены индексы: start_index={start_index}, end_index={end_index}")
+                logger.warning(f"start_item={start_item}, end_item={end_item}")
+                logger.warning(f"Доступные элементы: {all_items[:5]}{'...' if len(all_items) > 5 else ''}")
+                return
+            
+            # Определяем диапазон (от меньшего к большему индексу)
+            range_start = min(start_index, end_index)
+            range_end = max(start_index, end_index)
+            
+            # Сохраняем количество помеченных тикеров до выделения
+            old_marked_count = len(self.marked_tickers)
+            
+            # Очищаем предыдущие выделения в таблице, но НЕ очищаем marked_tickers
+            self.tree.selection_remove(self.tree.selection())
+            
+            # Добавляем тикеры из диапазона к уже существующим
+            selected_symbols = []
+            for i in range(range_start, range_end + 1):
+                item = all_items[i]
+                symbol = self.tree.item(item, "values")[0]
+                self.marked_tickers.add(symbol)  # add() добавляет только если элемента нет
+                selected_symbols.append(symbol)
+                self.tree.selection_add(item)
+            
+            # Синхронизируем визуальное выделение со всеми помеченными тикерами
+            self.update_table_selection()
+            
+            new_marked_count = len(self.marked_tickers)
+            logger.info(f"Выделен диапазон: {range_end - range_start + 1} тикеров, marked_tickers: {old_marked_count} → {new_marked_count}")
+            
+            # Проверяем, что все selected_symbols действительно добавлены в marked_tickers
+            missing_symbols = [s for s in selected_symbols if s not in self.marked_tickers]
+            if missing_symbols:
+                logger.error(f"ОШИБКА: Не добавлены в marked_tickers: {missing_symbols}")
+            
+            # Отложенно обновляем счетчик для обеспечения правильной синхронизации
+            self.root.after(10, self.update_marked_count_status)
+        except Exception as e:
+            logger.error(f"Ошибка при выделении диапазона: {e}")
 
     def on_tree_release(self, event):
         """Обработка отпускания кнопки мыши"""
         try:
-            # Синхронизируем выделение с множеством помеченных тикеров
-            self.update_table_selection()
+            # Просто обновляем счетчик для всех типов кликов
+            self.update_marked_count_status()
         except Exception as e:
             logger.error(f"Ошибка при обработке отпускания кнопки мыши: {e}")
     
     def update_marked_count_status(self):
         """Обновление счетчика помеченных тикеров в статусе"""
         try:
+            # Принудительно обновляем UI перед подсчетом
+            self.root.update_idletasks()
+            
             visible_tickers = self.get_visible_tickers()
             marked_visible = sum(1 for ticker in visible_tickers if ticker in self.marked_tickers)
             total_visible = len(visible_tickers)
+            total_marked = len(self.marked_tickers)
             
-            status_text = f"Помечено: {marked_visible}/{total_visible} видимых, {len(self.marked_tickers)} всего"
+            status_text = f"Помечено: {marked_visible}/{total_visible} видимых, {total_marked} всего"
             self.status_text.set(status_text)
+            
+            # Отладочная информация
+            logger.debug(f"update_marked_count_status: visible={total_visible}, marked_visible={marked_visible}, total_marked={total_marked}")
+            
+            # Проверяем, что marked_tickers не пустое, но marked_visible равно 0
+            if total_marked > 0 and marked_visible == 0:
+                logger.warning(f"ПРЕДУПРЕЖДЕНИЕ: marked_tickers содержит {total_marked} элементов, но marked_visible=0")
+            
+            # Дополнительная проверка: сравниваем видимые и помеченные тикеры
+            if total_marked > 0:
+                intersection = set(visible_tickers) & set(self.marked_tickers)
+                if len(intersection) != marked_visible:
+                    logger.error(f"ОШИБКА: Неправильный подсчет пересечения. Ожидалось {marked_visible}, получилось {len(intersection)}")
         except Exception as e:
             logger.error(f"Ошибка при обновлении счетчика тикеров: {e}")
 
@@ -668,14 +852,44 @@ class ByBitDownloader:
     def update_table_selection(self):
         """Синхронизация выделения таблицы с множеством помеченных тикеров"""
         try:
-            for item in self.tree.get_children():
+            logger.debug(f"update_table_selection: marked_tickers содержит {len(self.marked_tickers)} элементов")
+            
+            # Получаем все элементы таблицы
+            all_items = self.tree.get_children()
+            
+            # Сначала очищаем все выделения
+            current_selection = self.tree.selection()
+            self.tree.selection_remove(current_selection)
+            
+            # Затем собираем все элементы для выделения
+            items_to_select = []
+            for item in all_items:
                 symbol = self.tree.item(item, "values")[0]
                 if symbol in self.marked_tickers:
-                    self.tree.selection_add(item)
-                else:
-                    self.tree.selection_remove(item)
+                    items_to_select.append(item)
+            
+            # Выделяем все элементы сразу
+            if items_to_select:
+                self.tree.selection_set(items_to_select)
+                # Прокручиваем к первому выделенному элементу
+                self.tree.see(items_to_select[0])
+            
+            # Проверяем результат синхронизации
+            selected_items = self.tree.selection()
+            logger.debug(f"После синхронизации выделено {len(selected_items)} элементов в таблице")
+            
+            # Дополнительная проверка
+            selected_symbols = [self.tree.item(item, "values")[0] for item in selected_items]
+            
+            if set(selected_symbols) != self.marked_tickers:
+                logger.error(f"ОШИБКА: Визуальное выделение не соответствует marked_tickers после update_table_selection")
+                logger.error(f"Визуально выделено: {sorted(selected_symbols)}")
+                logger.error(f"Marked tickers: {sorted(list(self.marked_tickers))}")
+                logger.error(f"Разница: {set(selected_symbols) ^ self.marked_tickers}")
         except Exception as e:
             logger.error(f"Ошибка при синхронизации выделения таблицы: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
     
     def mark_all(self):
         """Пометка всех видимых тикеров"""
@@ -1076,9 +1290,20 @@ class ByBitDownloader:
                 start_ms = int(start_dt.timestamp() * 1000)
                 end_ms = int(end_dt.timestamp() * 1000)
                 
+                # Определяем категорию и оригинальный символ
+                if ticker.endswith("_linear"):
+                    category = "linear"
+                    original_symbol = ticker[:-7]  # Убираем "_linear"
+                elif ticker.endswith("_inverse"):
+                    category = "inverse"
+                    original_symbol = ticker[:-8]  # Убираем "_inverse"
+                else:
+                    category = "spot"
+                    original_symbol = ticker
+                
                 params = {
-                    "category": "spot",
-                    "symbol": ticker,
+                    "category": category,
+                    "symbol": original_symbol,
                     "interval": "1",  # 1 минута
                     "start": start_ms,
                     "end": end_ms,
@@ -1266,6 +1491,17 @@ class ByBitDownloader:
             logger.info("Установлено текущее время в поле end_date")
         except Exception as e:
             logger.error(f"Ошибка при установке текущего времени: {e}")
+
+    def reset_filters(self):
+        """Сброс фильтров"""
+        try:
+            self.filter_text.set("")
+            self.filter_category.set("Все")
+            self.apply_filter()
+            self.update_marked_count_status()
+            logger.info("Фильтры сброшены")
+        except Exception as e:
+            logger.error(f"Ошибка при сбросе фильтров: {e}")
 
 
 class SettingsWindow:
