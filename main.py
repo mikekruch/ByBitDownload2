@@ -227,6 +227,9 @@ class ByBitDownloader:
         self.tree.bind("<Shift-Button-1>", self.on_tree_shift_click)
         self.tree.bind("<ButtonRelease-1>", self.on_tree_release)
         
+        # Привязка для выделения активной строки
+        self.tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+        
         # Кнопки управления тикерами (справа от таблицы)
         ticker_buttons_frame = ttk.Frame(main_frame)
         ticker_buttons_frame.grid(row=2, column=3, sticky=(tk.N, tk.S), padx=(10, 0))
@@ -249,7 +252,20 @@ class ByBitDownloader:
         
         ttk.Button(buttons_frame, text="Обновить", command=self.refresh_tickers, width=20).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(buttons_frame, text="Сохранить тикеры", command=self.save_marked_tickers, width=20).pack(side=tk.LEFT, padx=5)
-        
+
+        # Перемещаем Combobox уровня логирования сюда
+        log_levels = ["INFO", "WARNING", "ERROR", "Не логировать"]
+        self.log_level = tk.StringVar()
+        saved_level = self.settings.get('Logging', 'level', fallback='INFO')
+        if saved_level not in log_levels:
+            saved_level = "INFO"
+        self.log_level.set(saved_level)
+        ttk.Label(buttons_frame, text="Уровень логирования:").pack(side=tk.LEFT, padx=(20, 5))
+        log_combo = ttk.Combobox(buttons_frame, textvariable=self.log_level, values=log_levels, state="readonly", width=15)
+        log_combo.pack(side=tk.LEFT, padx=5)
+        log_combo.bind("<<ComboboxSelected>>", lambda e: self.set_log_level(self.log_level.get()))
+        self.set_log_level(self.log_level.get())
+
         # Основные кнопки
         main_buttons_frame = ttk.Frame(main_frame)
         main_buttons_frame.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=(0, 10))
@@ -272,18 +288,18 @@ class ByBitDownloader:
         self.status_label = ttk.Label(status_frame, textvariable=self.status_text, relief=tk.SUNKEN, anchor=tk.W)
         self.status_label.grid(row=0, column=0, sticky=(tk.W, tk.E))
         
+        # Настройка тега для активной строки
+        self.tree.tag_configure("active", background="lightyellow")
+    
     def load_settings(self) -> configparser.ConfigParser:
         """Загрузка настроек из файла"""
         try:
             config = configparser.ConfigParser()
-            
             if os.path.exists('settings.ini'):
                 config.read('settings.ini', encoding='utf-8')
                 logger.info("Настройки загружены из файла")
             else:
                 logger.info("Файл настроек не найден, используются значения по умолчанию")
-            
-            # Установка значений по умолчанию если секции отсутствуют
             if 'Database' not in config:
                 config['Database'] = {
                     'host': 'localhost',
@@ -293,22 +309,20 @@ class ByBitDownloader:
                     'database': 'bybit_data',
                     'schema': 'public'
                 }
-            
             if 'Download' not in config:
                 config['Download'] = {
                     'threads': '5'
                 }
-            
             if 'Period' not in config:
                 config['Period'] = {
                     'start_date': datetime.now().strftime("%Y-%m-%d %H:%M"),
                     'end_date': datetime.now().strftime("%Y-%m-%d %H:%M")
                 }
-            
+            if 'Logging' not in config:
+                config['Logging'] = {'level': 'INFO'}
             return config
         except Exception as e:
             logger.error(f"Ошибка при загрузке настроек: {e}")
-            # Возвращаем конфигурацию по умолчанию
             config = configparser.ConfigParser()
             config['Database'] = {
                 'host': 'localhost',
@@ -323,31 +337,28 @@ class ByBitDownloader:
                 'start_date': datetime.now().strftime("%Y-%m-%d %H:%M"),
                 'end_date': datetime.now().strftime("%Y-%m-%d %H:%M")
             }
+            config['Logging'] = {'level': 'INFO'}
             return config
 
     def save_settings(self):
         """Сохранение настроек в файл"""
         try:
-            # Обновление периода
             if 'Period' not in self.settings:
                 self.settings['Period'] = {}
             self.settings['Period']['start_date'] = self.start_date.get()
             self.settings['Period']['end_date'] = self.end_date.get()
-            
-            # Шифрование пароля перед сохранением
             if 'Database' in self.settings and 'password' in self.settings['Database']:
                 password = self.settings['Database']['password']
                 if password and not password.startswith('encrypted:'):
                     encrypted_password = self.crypto_manager.encrypt(password)
                     self.settings['Database']['password'] = f"encrypted:{encrypted_password}"
-            
-            # Сохранение в файл
+            # Сохраняем уровень логирования
+            if 'Logging' not in self.settings:
+                self.settings['Logging'] = {}
+            self.settings['Logging']['level'] = self.log_level.get()
             with open('settings.ini', 'w', encoding='utf-8') as f:
                 self.settings.write(f)
-            
-            # Сохранение помеченных тикеров
             self.save_marked_tickers()
-            
             logger.info("Настройки сохранены")
         except Exception as e:
             logger.error(f"Ошибка при сохранении настроек: {e}")
@@ -670,6 +681,9 @@ class ByBitDownloader:
                 # Обновляем последний активный тикер
                 self.last_active_item = item
                 
+                # Выделяем активную строку
+                self.highlight_active_row()
+                
                 # Обновляем счетчик
                 self.update_marked_count_status()
         except Exception as e:
@@ -694,6 +708,9 @@ class ByBitDownloader:
                 # Синхронизируем визуальное выделение со всеми помеченными тикерами
                 self.update_table_selection()
                 
+                # Выделяем активную строку
+                self.highlight_active_row()
+                
                 # Принудительно обновляем UI
                 self.root.update_idletasks()
                 
@@ -712,17 +729,22 @@ class ByBitDownloader:
             if item:
                 symbol = self.tree.item(item, "values")[0]
                 
-                # Если есть последний активный тикер, выделяем диапазон от него до текущего
+                # Если есть последний активный тикер и он отличается от текущего, выделяем диапазон
                 if self.last_active_item and self.last_active_item != item:
                     self.select_range(self.last_active_item, item)
                 else:
-                    # Если нет последнего активного тикера, просто добавляем текущий
+                    # Если нет последнего активного тикера или он совпадает с текущим, просто добавляем текущий
                     self.marked_tickers.add(symbol)
                     self.tree.selection_add(item)
                 
-                # Обновляем последний активный тикер
+                # Обновляем последний активный тикер на текущий
                 self.last_active_item = item
                 
+                # Выделяем активную строку
+                self.highlight_active_row()
+                
+                # Предотвращаем стандартную обработку клика
+                return "break"
         except Exception as e:
             logger.error(f"Ошибка при обработке Shift+клика по таблице: {e}")
     
@@ -801,44 +823,119 @@ class ByBitDownloader:
             logger.error(f"Ошибка при выделении диапазона: {e}")
 
     def on_tree_release(self, event):
-        """Обработка отпускания кнопки мыши"""
         try:
-            # Просто обновляем счетчик для всех типов кликов
+            # Обновляем счетчик и восстанавливаем активную строку
             self.update_marked_count_status()
+            self.root.after(10, self.highlight_active_row)
         except Exception as e:
             logger.error(f"Ошибка при обработке отпускания кнопки мыши: {e}")
     
-    def update_marked_count_status(self):
-        """Обновление счетчика помеченных тикеров в статусе"""
+    def on_tree_select(self, event):
+        """Обработка события выбора строки в таблице"""
         try:
-            # Принудительно обновляем UI перед подсчетом
-            self.root.update_idletasks()
-            
-            visible_tickers = self.get_visible_tickers()
-            marked_visible = sum(1 for ticker in visible_tickers if ticker in self.marked_tickers)
-            total_visible = len(visible_tickers)
-            total_marked = len(self.marked_tickers)
-            
-            status_text = f"Помечено: {marked_visible}/{total_visible} видимых, {total_marked} всего"
-            self.status_text.set(status_text)
-            
-            # Отладочная информация
-            logger.debug(f"update_marked_count_status: visible={total_visible}, marked_visible={marked_visible}, total_marked={total_marked}")
-            
-            # Проверяем, что marked_tickers не пустое, но marked_visible равно 0
-            if total_marked > 0 and marked_visible == 0:
-                logger.warning(f"ПРЕДУПРЕЖДЕНИЕ: marked_tickers содержит {total_marked} элементов, но marked_visible=0")
-            
-            # Дополнительная проверка: сравниваем видимые и помеченные тикеры
-            if total_marked > 0:
-                intersection = set(visible_tickers) & set(self.marked_tickers)
-                if len(intersection) != marked_visible:
-                    logger.error(f"ОШИБКА: Неправильный подсчет пересечения. Ожидалось {marked_visible}, получилось {len(intersection)}")
+            selected_items = self.tree.selection()
+            if selected_items:
+                new_active_item = selected_items[0]
+                if new_active_item != self.last_active_item:
+                    self.last_active_item = new_active_item
+                    logger.debug(f"Выбор изменен на: {self.tree.item(new_active_item, 'values')[0]}")
+                self.highlight_active_row()
+                self.update_marked_count_status()
         except Exception as e:
-            logger.error(f"Ошибка при обновлении счетчика тикеров: {e}")
+            logger.error(f"Ошибка при обработке события выбора строки: {e}")
+    
+    def highlight_active_row(self):
+        """Выделение активной строки другим цветом"""
+        try:
+            # Убираем тег "active" со всех строк, но сохраняем другие теги
+            for item in self.tree.get_children():
+                current_tags = list(self.tree.item(item, "tags"))
+                if "active" in current_tags:
+                    current_tags.remove("active")
+                self.tree.item(item, tags=current_tags)
+            
+            # Выделяем активную строку, добавляя тег "active" к существующим тегам
+            if self.last_active_item:
+                current_tags = list(self.tree.item(self.last_active_item, "tags"))
+                if "active" not in current_tags:
+                    current_tags.append("active")
+                self.tree.item(self.last_active_item, tags=current_tags)
+                self.tree.see(self.last_active_item)
+        except Exception as e:
+            logger.error(f"Ошибка при выделении активной строки: {e}")
 
-    def get_visible_tickers(self) -> List[str]:
-        """Получение списка видимых (отфильтрованных) тикеров"""
+    def exit_program(self):
+        try:
+            # Останавливаем загрузку если она идет
+            if hasattr(self, 'download_thread') and self.download_thread and self.download_thread.is_alive():
+                self.stop_download = True
+                logger.info("Остановка загрузки при выходе из программы...")
+                self.download_thread.join(timeout=5)
+                if self.download_thread.is_alive():
+                    logger.warning("Поток загрузки не завершился в течение 5 секунд")
+            # Сохраняем настройки
+            self.save_settings()
+            logger.info("Корректное завершение программы")
+        except Exception as e:
+            logger.error(f"Ошибка при выходе из программы: {e}")
+        finally:
+            self.root.quit()
+            self.root.destroy()
+
+    def set_end_date_to_now(self):
+        try:
+            self.end_date.set(datetime.now().strftime("%Y-%m-%d %H:%M"))
+            logger.info("Установлено текущее время в поле end_date")
+        except Exception as e:
+            logger.error(f"Ошибка при установке текущего времени: {e}")
+
+    def reset_filters(self):
+        try:
+            self.filter_text.set("")
+            self.filter_category.set("Все")
+            self.apply_filter()
+            self.update_marked_count_status()
+            logger.info("Фильтры сброшены")
+        except Exception as e:
+            logger.error(f"Ошибка при сбросе фильтров: {e}")
+
+    def mark_all(self):
+        try:
+            visible_tickers = self.get_visible_tickers()
+            for ticker in visible_tickers:
+                self.marked_tickers.add(ticker)
+            self.update_table_selection()
+            self.update_marked_count_status()
+            logger.info(f"Помечено {len(visible_tickers)} тикеров")
+        except Exception as e:
+            logger.error(f"Ошибка при пометке всех тикеров: {e}")
+
+    def unmark_all(self):
+        try:
+            visible_tickers = self.get_visible_tickers()
+            for ticker in visible_tickers:
+                self.marked_tickers.discard(ticker)
+            self.update_table_selection()
+            self.update_marked_count_status()
+            logger.info(f"Снята пометка с {len(visible_tickers)} тикеров")
+        except Exception as e:
+            logger.error(f"Ошибка при снятии пометки со всех тикеров: {e}")
+
+    def invert_marks(self):
+        try:
+            visible_tickers = self.get_visible_tickers()
+            for ticker in visible_tickers:
+                if ticker in self.marked_tickers:
+                    self.marked_tickers.remove(ticker)
+                else:
+                    self.marked_tickers.add(ticker)
+            self.update_table_selection()
+            self.update_marked_count_status()
+            logger.info("Инвертированы пометки тикеров")
+        except Exception as e:
+            logger.error(f"Ошибка при инвертировании пометок: {e}")
+
+    def get_visible_tickers(self):
         try:
             visible_tickers = []
             for item in self.tree.get_children():
@@ -850,105 +947,41 @@ class ByBitDownloader:
             return []
 
     def update_table_selection(self):
-        """Синхронизация выделения таблицы с множеством помеченных тикеров"""
         try:
-            logger.debug(f"update_table_selection: marked_tickers содержит {len(self.marked_tickers)} элементов")
-            
-            # Получаем все элементы таблицы
             all_items = self.tree.get_children()
-            
-            # Сначала очищаем все выделения
             current_selection = self.tree.selection()
             self.tree.selection_remove(current_selection)
-            
-            # Затем собираем все элементы для выделения
             items_to_select = []
             for item in all_items:
                 symbol = self.tree.item(item, "values")[0]
                 if symbol in self.marked_tickers:
                     items_to_select.append(item)
-            
-            # Выделяем все элементы сразу
             if items_to_select:
                 self.tree.selection_set(items_to_select)
-                # Прокручиваем к первому выделенному элементу
                 self.tree.see(items_to_select[0])
-            
-            # Проверяем результат синхронизации
-            selected_items = self.tree.selection()
-            logger.debug(f"После синхронизации выделено {len(selected_items)} элементов в таблице")
-            
-            # Дополнительная проверка
-            selected_symbols = [self.tree.item(item, "values")[0] for item in selected_items]
-            
-            if set(selected_symbols) != self.marked_tickers:
-                logger.error(f"ОШИБКА: Визуальное выделение не соответствует marked_tickers после update_table_selection")
-                logger.error(f"Визуально выделено: {sorted(selected_symbols)}")
-                logger.error(f"Marked tickers: {sorted(list(self.marked_tickers))}")
-                logger.error(f"Разница: {set(selected_symbols) ^ self.marked_tickers}")
+            self.root.after(5, self.highlight_active_row)
         except Exception as e:
             logger.error(f"Ошибка при синхронизации выделения таблицы: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-    
-    def mark_all(self):
-        """Пометка всех видимых тикеров"""
+
+    def update_marked_count_status(self):
         try:
+            self.root.update_idletasks()
             visible_tickers = self.get_visible_tickers()
-            for ticker in visible_tickers:
-                self.marked_tickers.add(ticker)
-            
-            self.update_table_selection()
-            self.update_marked_count_status()
-            logger.info(f"Помечено {len(visible_tickers)} тикеров")
+            marked_visible = sum(1 for ticker in visible_tickers if ticker in self.marked_tickers)
+            total_visible = len(visible_tickers)
+            total_marked = len(self.marked_tickers)
+            status_text = f"Помечено: {marked_visible}/{total_visible} видимых, {total_marked} всего"
+            self.status_text.set(status_text)
         except Exception as e:
-            logger.error(f"Ошибка при пометке всех тикеров: {e}")
-    
-    def unmark_all(self):
-        """Снятие пометки со всех видимых тикеров"""
-        try:
-            visible_tickers = self.get_visible_tickers()
-            for ticker in visible_tickers:
-                self.marked_tickers.discard(ticker)
-            
-            self.update_table_selection()
-            self.update_marked_count_status()
-            logger.info(f"Снята пометка с {len(visible_tickers)} тикеров")
-        except Exception as e:
-            logger.error(f"Ошибка при снятии пометки со всех тикеров: {e}")
-    
-    def invert_marks(self):
-        """Инвертирование пометок видимых тикеров"""
-        try:
-            visible_tickers = self.get_visible_tickers()
-            for ticker in visible_tickers:
-                if ticker in self.marked_tickers:
-                    self.marked_tickers.remove(ticker)
-                else:
-                    self.marked_tickers.add(ticker)
-            
-            self.update_table_selection()
-            self.update_marked_count_status()
-            logger.info("Инвертированы пометки тикеров")
-        except Exception as e:
-            logger.error(f"Ошибка при инвертировании пометок: {e}")
-    
-    def open_settings(self):
-        """Открытие окна настроек"""
-        try:
-            SettingsWindow(self.root, self.settings, self.save_settings, self.crypto_manager)
-        except Exception as e:
-            logger.error(f"Ошибка при открытии окна настроек: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось открыть окно настроек: {e}")
-    
+            logger.error(f"Ошибка при обновлении счетчика тикеров: {e}")
+
     def start_download(self):
-        """Запуск процесса загрузки"""
         try:
             # Проверка выбранных тикеров
             if not self.marked_tickers:
                 messagebox.showwarning("Предупреждение", "Не выбрано ни одного тикера для загрузки")
                 return
-            
+
             # Парсинг дат
             try:
                 start_dt = datetime.strptime(self.start_date.get(), "%Y-%m-%d %H:%M")
@@ -956,12 +989,12 @@ class ByBitDownloader:
             except ValueError:
                 messagebox.showerror("Ошибка", "Неверный формат даты. Используйте формат: YYYY-MM-DD HH:MM")
                 return
-            
+
             # Проверка периода
             if start_dt >= end_dt:
                 messagebox.showerror("Ошибка", "Начальная дата должна быть меньше конечной")
                 return
-            
+
             # Запуск загрузки в отдельном потоке - только помеченные тикеры
             self.stop_download = False
             self.download_thread = threading.Thread(
@@ -970,70 +1003,79 @@ class ByBitDownloader:
             )
             self.download_thread.daemon = True
             self.download_thread.start()
-            
+
             # Обновление UI
             self.download_button.config(state=tk.DISABLED)
             self.stop_button.config(state=tk.NORMAL)
             self.progress_value.set(0)
             self.status_text.set(f"Начало загрузки {len(self.marked_tickers)} помеченных тикеров...")
-            
+
         except Exception as e:
             error_msg = f"Ошибка при запуске загрузки: {e}"
             logger.error(error_msg)
             messagebox.showerror("Ошибка", error_msg)
             self.finish_download()
-    
+
     def stop_download_process(self):
-        """Остановка процесса загрузки"""
         try:
             self.stop_download = True
             self.status_text.set("Остановка загрузки...")
             logger.info("Запрошена остановка загрузки")
         except Exception as e:
             logger.error(f"Ошибка при остановке загрузки: {e}")
-    
-    def download_process(self, start_dt: datetime, end_dt: datetime, tickers: List[str]):
-        """Процесс загрузки данных"""
+
+    def open_settings(self):
         try:
-            # Создание асинхронного цикла
-            self.loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self.loop)
-            
-            # Запуск асинхронной загрузки
-            self.loop.run_until_complete(self.async_download(start_dt, end_dt, tickers))
-            
+            SettingsWindow(self.root, self.settings, self.save_settings, self.crypto_manager)
+        except Exception as e:
+            logger.error(f"Ошибка при открытии окна настроек: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось открыть окно настроек: {e}")
+
+    def run(self):
+        try:
+            self.root.mainloop()
+        except Exception as e:
+            logger.error(f"Ошибка в главном цикле приложения: {e}")
+
+    def download_process(self, start_dt, end_dt, tickers):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.async_download(start_dt, end_dt, tickers))
+            loop.close()
         except Exception as e:
             logger.error(f"Ошибка в процессе загрузки: {e}")
             self.root.after(0, lambda: self.status_text.set(f"Ошибка загрузки: {e}"))
         finally:
-            # Восстановление UI
             self.root.after(0, self.finish_download)
-            # Очищаем ссылку на loop
-            self.loop = None
-    
-    async def async_download(self, start_dt: datetime, end_dt: datetime, tickers: List[str]):
-        """Асинхронная загрузка данных"""
+
+    def finish_download(self):
         try:
-            # Инициализация состояния прогресса
+            self.download_button.config(state=tk.NORMAL)
+            self.stop_button.config(state=tk.DISABLED)
+            self.progress_value.set(0)
+            if self.stop_download:
+                self.status_text.set("Загрузка прервана пользователем")
+                logger.info("Загрузка прервана пользователем")
+            else:
+                self.status_text.set("Загрузка завершена")
+                logger.info("Загрузка завершена успешно")
+        except Exception as e:
+            logger.error(f"Ошибка при завершении загрузки: {e}")
+
+    async def async_download(self, start_dt, end_dt, tickers):
+        try:
             progress_state = {
                 'processed_tickers': 0,
                 'processed_minutes': 0,
                 'lock': asyncio.Lock()
             }
-            
-            # Подсчет общего количества минут
             total_minutes = int((end_dt - start_dt).total_seconds() / 60) * len(tickers)
-            
-            # Создание семафора для ограничения одновременных подключений
             max_connections = int(self.settings.get('Download', 'threads', fallback='5'))
             semaphore = asyncio.Semaphore(max_connections)
-            
-            # Запуск обновления прогресса
             progress_task = asyncio.create_task(
                 self.progress_updater(progress_state, len(tickers), total_minutes)
             )
-            
-            # Создание задач для каждого тикера
             tasks = []
             for ticker in tickers:
                 if self.stop_download:
@@ -1042,45 +1084,32 @@ class ByBitDownloader:
                     self.download_ticker_data(ticker, start_dt, end_dt, semaphore, progress_state)
                 )
                 tasks.append(task)
-            
-            # Ожидание завершения всех задач
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Отмена задачи обновления прогресса
             progress_task.cancel()
             try:
                 await progress_task
             except asyncio.CancelledError:
                 pass
-            
             logger.info("Асинхронная загрузка завершена")
-            
         except asyncio.CancelledError:
             logger.info("Асинхронная загрузка отменена")
             raise
         except Exception as e:
             logger.error(f"Ошибка в асинхронной загрузке: {e}")
             raise
-    
-    async def progress_updater(self, progress_state: dict, total_tickers: int, total_minutes: int):
-        """Обновление прогресса в UI"""
+
+    async def progress_updater(self, progress_state, total_tickers, total_minutes):
         try:
             while not self.stop_download:
                 async with progress_state['lock']:
                     processed_tickers = progress_state['processed_tickers']
                     processed_minutes = progress_state['processed_minutes']
-                
-                # Обновление UI в главном потоке
                 self.root.after(0, lambda: self.update_progress(
                     processed_tickers, total_tickers, processed_minutes, total_minutes
                 ))
-                
-                # Проверка завершения
                 if processed_tickers >= total_tickers:
                     break
-                
-                # Пауза между обновлениями
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             logger.info("Обновление прогресса отменено")
@@ -1088,28 +1117,21 @@ class ByBitDownloader:
         except Exception as e:
             logger.error(f"Ошибка в обновлении прогресса: {e}")
             raise
-    
-    async def download_ticker_data(self, ticker: str, start_dt: datetime, end_dt: datetime, 
-                                 semaphore: asyncio.Semaphore, progress_state: dict):
-        """Загрузка данных для одного тикера"""
+
+    async def download_ticker_data(self, ticker, start_dt, end_dt, semaphore, progress_state):
         async with semaphore:
             try:
-                # Подключение к базе данных
+                import asyncpg
                 conn = await asyncpg.connect(
                     host=self.settings.get('Database', 'host'),
                     port=self.settings.get('Database', 'port'),
                     user=self.settings.get('Database', 'user'),
-                    password=self.crypto_manager.decrypt(self.settings.get('Database', 'password')),
+                    password=self.crypto_manager.decrypt(self.settings.get('Database', 'password').replace('encrypted:', '')),
                     database=self.settings.get('Database', 'database')
                 )
-                
                 try:
-                    # Создание таблицы если не существует
                     await self.create_ticker_table(conn, ticker)
-                    
-                    # Поиск пропусков в данных
                     gaps = await self.find_data_gaps(conn, ticker, start_dt, end_dt)
-                    
                     if gaps:
                         logger.info(f"Найдено {len(gaps)} пропусков в данных для {ticker}")
                         for gap_start, gap_end in gaps:
@@ -1118,79 +1140,47 @@ class ByBitDownloader:
                             await self.download_period_data(conn, ticker, gap_start, gap_end, progress_state)
                     else:
                         logger.info(f"Пропусков в данных для {ticker} не найдено")
-                    
-                    # Обновляем прогресс по тикерам
                     async with progress_state['lock']:
                         progress_state['processed_tickers'] += 1
-                    
                 finally:
                     await conn.close()
-                    
             except asyncio.CancelledError:
                 logger.info(f"Загрузка данных для {ticker} отменена")
                 raise
             except Exception as e:
                 logger.error(f"Ошибка при загрузке данных для {ticker}: {e}")
-                # Обновляем прогресс даже при ошибке
                 async with progress_state['lock']:
                     progress_state['processed_tickers'] += 1
-    
-    async def find_data_gaps(self, conn, ticker: str, start_dt: datetime, end_dt: datetime) -> List[Tuple[datetime, datetime]]:
-        """Поиск пропусков в данных"""
+
+    async def find_data_gaps(self, conn, ticker, start_dt, end_dt):
         try:
             schema = self.settings.get('Database', 'schema', fallback='public')
-            table_name = f"{ticker}_1m"
-            
-            # Получение существующих временных меток
+            # Replace hyphens with underscores in the table name
+            table_name = f"klines_{ticker.lower().replace('-', '_')}"
             query = f"""
                 SELECT timestamp 
                 FROM {schema}.{table_name} 
                 WHERE timestamp >= $1 AND timestamp <= $2 
                 ORDER BY timestamp
             """
-            
             rows = await conn.fetch(query, start_dt, end_dt)
-            existing_timestamps = [row['timestamp'] for row in rows]
-            
+            existing_timestamps = set(row['timestamp'] for row in rows)
             if not existing_timestamps:
-                # Если данных нет вообще, возвращаем весь период
                 return [(start_dt, end_dt)]
-            
             gaps = []
+            current_gap_start = None
             current_time = start_dt
-            
-            # Проверяем каждый интервал в минуту
             while current_time < end_dt:
-                next_time = current_time + timedelta(minutes=1)
-                
-                # Ищем ближайшую существующую метку времени
-                found = False
-                for ts in existing_timestamps:
-                    if ts >= current_time and ts < next_time:
-                        found = True
-                        break
-                
-                if not found:
-                    # Найден пропуск
-                    gap_start = current_time
-                    
-                    # Ищем конец пропуска
-                    while current_time < end_dt:
-                        next_time = current_time + timedelta(minutes=1)
-                        found = False
-                        for ts in existing_timestamps:
-                            if ts >= current_time and ts < next_time:
-                                found = True
-                                break
-                        
-                        if found:
-                            break
-                        current_time = next_time
-                    
-                    gaps.append((gap_start, current_time))
+                if current_time not in existing_timestamps:
+                    if current_gap_start is None:
+                        current_gap_start = current_time
                 else:
-                    current_time = next_time
-            
+                    if current_gap_start is not None:
+                        gaps.append((current_gap_start, current_time))
+                        current_gap_start = None
+                current_time += timedelta(minutes=1)
+            if current_gap_start is not None:
+                gaps.append((current_gap_start, end_dt))
             return gaps
         except asyncio.CancelledError:
             logger.info(f"Поиск пропусков для {ticker} отменен")
@@ -1198,17 +1188,12 @@ class ByBitDownloader:
         except Exception as e:
             logger.error(f"Ошибка при поиске пропусков для {ticker}: {e}")
             raise
-    
-    async def create_ticker_table(self, conn, ticker: str):
-        """Создание таблицы для тикера если не существует"""
+
+    async def create_ticker_table(self, conn, ticker):
         try:
             schema = self.settings.get('Database', 'schema', fallback='public')
-            table_name = f"{ticker}_1m"
-            
-            # Создание схемы если не существует
+            table_name = f"klines_{ticker.lower().replace('-', '_')}"
             await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
-            
-            # Создание таблицы
             query = f"""
                 CREATE TABLE IF NOT EXISTS {schema}.{table_name} (
                     timestamp TIMESTAMP PRIMARY KEY,
@@ -1220,7 +1205,6 @@ class ByBitDownloader:
                     turnover DECIMAL(20, 8)
                 )
             """
-            
             await conn.execute(query)
             logger.info(f"Таблица {schema}.{table_name} готова")
         except asyncio.CancelledError:
@@ -1229,49 +1213,41 @@ class ByBitDownloader:
         except Exception as e:
             logger.error(f"Ошибка при создании таблицы для {ticker}: {e}")
             raise
-    
-    async def download_period_data(self, conn, ticker: str, start_dt: datetime, end_dt: datetime, progress_state: dict):
-        """Загрузка данных за период"""
+
+    async def download_period_data(self, conn, ticker, start_dt, end_dt, progress_state):
         try:
-            # Разбиение на блоки по 600 минут
             block_size = timedelta(minutes=600)
             current_start = start_dt
-            
             logger.info(f"Начало загрузки данных для {ticker} за период {start_dt} - {end_dt}")
-            
             while current_start < end_dt and not self.stop_download:
                 current_end = min(current_start + block_size, end_dt)
-                
-                # Попытки загрузки с повторами
+                logger.info(f"Пробую загрузить данные для {ticker}: {current_start} - {current_end}")
                 for attempt in range(3):
                     try:
                         data = await self.fetch_bybit_data(ticker, current_start, current_end)
+                        logger.info(f"fetch_bybit_data вернул {len(data) if data else 0} строк для {ticker} за период {current_start} - {current_end}")
                         if data:
                             await self.insert_data_to_db(conn, ticker, data)
-                            
-                            # Обновляем прогресс после записи в базу
                             minutes_processed = int((current_end - current_start).total_seconds() / 60)
                             async with progress_state['lock']:
                                 progress_state['processed_minutes'] += minutes_processed
-                            
                             logger.info(f"Загружено {len(data)} записей для {ticker} за период {current_start} - {current_end}")
                             break
                         else:
-                            raise Exception("Пустой ответ от API")
-                            
+                            logger.info(f"Пустой ответ от API для {ticker} за период {current_start} - {current_end}")
+                            break
                     except asyncio.CancelledError:
                         logger.info(f"Загрузка данных для {ticker} отменена")
                         raise
                     except Exception as e:
-                        if attempt == 2:  # Последняя попытка
+                        if attempt == 2:
                             logger.error(f"Не удалось загрузить данные для {ticker} за период {current_start}-{current_end}: {e}")
                             raise
                         else:
                             logger.warning(f"Попытка {attempt + 1} для {ticker} за период {current_start}-{current_end}: {e}")
-                            await asyncio.sleep(2)  # Пауза перед повтором
-                
+                            await asyncio.sleep(2)
+                logger.info(f"current_start={current_start}, current_end={current_end}, end_dt={end_dt}")
                 current_start = current_end
-            
             logger.info(f"Завершена загрузка данных для {ticker} за период {start_dt} - {end_dt}")
         except asyncio.CancelledError:
             logger.info(f"Загрузка периода для {ticker} отменена")
@@ -1279,50 +1255,39 @@ class ByBitDownloader:
         except Exception as e:
             logger.error(f"Ошибка при загрузке периода для {ticker}: {e}")
             raise
-    
-    async def fetch_bybit_data(self, ticker: str, start_dt: datetime, end_dt: datetime) -> List[Dict]:
-        """Получение данных с ByBit API"""
+
+    async def fetch_bybit_data(self, ticker, start_dt, end_dt):
         try:
+            import aiohttp
             async with aiohttp.ClientSession() as session:
                 url = "https://api.bybit.com/v5/market/kline"
-                
-                # Конвертация в миллисекунды
                 start_ms = int(start_dt.timestamp() * 1000)
                 end_ms = int(end_dt.timestamp() * 1000)
-                
-                # Определяем категорию и оригинальный символ
                 if ticker.endswith("_linear"):
                     category = "linear"
-                    original_symbol = ticker[:-7]  # Убираем "_linear"
+                    original_symbol = ticker[:-7]
                 elif ticker.endswith("_inverse"):
                     category = "inverse"
-                    original_symbol = ticker[:-8]  # Убираем "_inverse"
+                    original_symbol = ticker[:-8]
                 else:
                     category = "spot"
                     original_symbol = ticker
-                
                 params = {
                     "category": category,
                     "symbol": original_symbol,
-                    "interval": "1",  # 1 минута
+                    "interval": "1",
                     "start": start_ms,
                     "end": end_ms,
                     "limit": 1000
                 }
-                
                 async with session.get(url, params=params) as response:
                     if response.status != 200:
                         raise Exception(f"HTTP {response.status}: {await response.text()}")
-                    
                     data = await response.json()
-                    
                     if data.get("retCode") != 0:
                         raise Exception(f"API ошибка: {data.get('retMsg', 'Неизвестная ошибка')}")
-                    
                     result = data.get("result", {})
                     klines = result.get("list", [])
-                    
-                    # Преобразование данных
                     formatted_data = []
                     for kline in klines:
                         formatted_data.append({
@@ -1334,7 +1299,6 @@ class ByBitDownloader:
                             "volume": float(kline[5]),
                             "turnover": float(kline[6])
                         })
-                    
                     return formatted_data
         except asyncio.CancelledError:
             logger.info(f"Запрос для {ticker} отменен")
@@ -1342,17 +1306,14 @@ class ByBitDownloader:
         except Exception as e:
             logger.error(f"Ошибка при получении данных для {ticker}: {e}")
             raise
-    
-    async def insert_data_to_db(self, conn, ticker: str, data: List[Dict]):
-        """Вставка данных в базу данных"""
+
+    async def insert_data_to_db(self, conn, ticker, data):
         try:
             if not data:
                 return
-            
             schema = self.settings.get('Database', 'schema', fallback='public')
-            table_name = f"{ticker}_1m"
-            
-            # Подготовка данных для вставки
+            # Replace hyphens with underscores in the table name
+            table_name = f"klines_{ticker.lower().replace('-', '_')}"
             values = []
             for row in data:
                 values.append((
@@ -1364,8 +1325,6 @@ class ByBitDownloader:
                     row["volume"],
                     row["turnover"]
                 ))
-            
-            # Вставка данных
             query = f"""
                 INSERT INTO {schema}.{table_name} 
                 (timestamp, open, high, low, close, volume, turnover)
@@ -1378,7 +1337,6 @@ class ByBitDownloader:
                     volume = EXCLUDED.volume,
                     turnover = EXCLUDED.turnover
             """
-            
             await conn.executemany(query, values)
             logger.info(f"Вставлено {len(values)} записей в таблицу {schema}.{table_name}")
         except asyncio.CancelledError:
@@ -1387,22 +1345,14 @@ class ByBitDownloader:
         except Exception as e:
             logger.error(f"Ошибка при вставке данных для {ticker}: {e}")
             raise
-    
-    def update_progress(self, processed_tickers: int, total_tickers: int, 
-                       processed_minutes: int, total_minutes: int):
-        """Обновление прогресса"""
+
+    def update_progress(self, processed_tickers, total_tickers, processed_minutes, total_minutes):
         if total_tickers > 0:
-            # Прогресс по тикерам
             ticker_progress = (processed_tickers / total_tickers) * 100
-            
-            # Прогресс по минутам (если есть данные)
             minute_progress = 0
             if total_minutes > 0:
                 minute_progress = (processed_minutes / total_minutes) * 100
-            
-            # Общий прогресс (среднее между тикерами и минутами)
             overall_progress = (ticker_progress + minute_progress) / 2 if total_minutes > 0 else ticker_progress
-            
             self.root.after(0, lambda: self.progress_value.set(overall_progress))
             self.root.after(0, lambda: self.status_text.set(
                 f"Обработано тикеров: {processed_tickers}/{total_tickers} "
@@ -1411,97 +1361,20 @@ class ByBitDownloader:
                 f"({minute_progress:.1f}%) | "
                 f"Общий прогресс: {overall_progress:.1f}%"
             ))
-    
-    def finish_download(self):
-        """Завершение загрузки"""
-        try:
-            self.download_button.config(state=tk.NORMAL)
-            self.stop_button.config(state=tk.DISABLED)
-            self.progress_value.set(0)
-            
-            if self.stop_download:
-                self.status_text.set("Загрузка прервана пользователем")
-                logger.info("Загрузка прервана пользователем")
-            else:
-                self.status_text.set("Загрузка завершена")
-                logger.info("Загрузка завершена успешно")
-        except Exception as e:
-            logger.error(f"Ошибка при завершении загрузки: {e}")
-    
-    def exit_program(self):
-        """Выход из программы"""
-        try:
-            # Останавливаем загрузку если она идет
-            if self.download_thread and self.download_thread.is_alive():
-                self.stop_download = True
-                logger.info("Остановка загрузки при выходе из программы...")
-                
-                # Ждем завершения потока загрузки (максимум 5 секунд)
-                self.download_thread.join(timeout=5)
-                if self.download_thread.is_alive():
-                    logger.warning("Поток загрузки не завершился в течение 5 секунд")
-            
-            # Отменяем все активные асинхронные задачи
-            if self.loop and not self.loop.is_closed():
-                try:
-                    # Отменяем все pending задачи
-                    pending_tasks = asyncio.all_tasks(self.loop)
-                    for task in pending_tasks:
-                        if not task.done():
-                            task.cancel()
-                    
-                    # Даем время на корректное завершение
-                    if pending_tasks:
-                        self.loop.run_until_complete(asyncio.wait(pending_tasks, timeout=3))
-                    
-                    # Закрываем loop
-                    self.loop.close()
-                except Exception as e:
-                    logger.warning(f"Ошибка при закрытии event loop: {e}")
-            
-            # Сохраняем настройки
-            self.save_settings()
-            
-            logger.info("Корректное завершение программы")
-            
-        except Exception as e:
-            logger.error(f"Ошибка при выходе из программы: {e}")
-        finally:
-            # Принудительно закрываем программу
-            self.root.quit()
-            self.root.destroy()
-    
-    def run(self):
-        """Запуск приложения"""
-        try:
-            self.root.mainloop()
-        except Exception as e:
-            logger.error(f"Ошибка в главном цикле приложения: {e}")
-        finally:
-            # Обеспечиваем корректное завершение при любых обстоятельствах
-            try:
-                self.exit_program()
-            except:
-                pass
 
-    def set_end_date_to_now(self):
-        """Установка текущего времени в поле end_date"""
-        try:
-            self.end_date.set(datetime.now().strftime("%Y-%m-%d %H:%M"))
-            logger.info("Установлено текущее время в поле end_date")
-        except Exception as e:
-            logger.error(f"Ошибка при установке текущего времени: {e}")
-
-    def reset_filters(self):
-        """Сброс фильтров"""
-        try:
-            self.filter_text.set("")
-            self.filter_category.set("Все")
-            self.apply_filter()
-            self.update_marked_count_status()
-            logger.info("Фильтры сброшены")
-        except Exception as e:
-            logger.error(f"Ошибка при сбросе фильтров: {e}")
+    def set_log_level(self, level):
+        import logging
+        root_logger = logging.getLogger()
+        if level == "Не логировать":
+            root_logger.disabled = True
+        else:
+            root_logger.disabled = False
+            if level == "INFO":
+                root_logger.setLevel(logging.INFO)
+            elif level == "WARNING":
+                root_logger.setLevel(logging.WARNING)
+            elif level == "ERROR":
+                root_logger.setLevel(logging.ERROR)
 
 
 class SettingsWindow:
