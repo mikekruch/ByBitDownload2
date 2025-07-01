@@ -15,6 +15,7 @@ import base64
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+import psycopg2
 
 # Настройка логирования
 logging.basicConfig(
@@ -977,6 +978,41 @@ class ByBitDownloader:
 
     def start_download(self):
         try:
+            # Создание/обновление функции generate_minute_intervals в базе
+            schema = self.settings.get('Database', 'schema', fallback='public')
+            query = f"""
+                CREATE OR REPLACE FUNCTION {schema}.generate_minute_intervals(start_time timestamp, end_time timestamp)
+                RETURNS TABLE (minute_timestamp timestamp) AS $$
+                BEGIN
+                    RETURN QUERY
+                    WITH RECURSIVE time_series AS (
+                        SELECT start_time AS minute
+                        UNION ALL
+                        SELECT minute + interval '1 minute'
+                        FROM time_series
+                        WHERE minute < end_time
+                    )
+                    SELECT minute FROM time_series;
+                END;
+                $$ LANGUAGE plpgsql;
+            """
+            try:
+                conn = psycopg2.connect(
+                    host=self.settings.get('Database', 'host'),
+                    port=self.settings.get('Database', 'port'),
+                    user=self.settings.get('Database', 'user'),
+                    password=self.crypto_manager.decrypt(self.settings.get('Database', 'password').replace('encrypted:', '')),
+                    database=self.settings.get('Database', 'database')
+                )
+                conn.autocommit = True
+                with conn.cursor() as cur:
+                    cur.execute(query)
+                conn.close()
+                logger.info("Функция generate_minute_intervals успешно создана/обновлена в базе данных")
+            except Exception as e:
+                logger.error(f"Ошибка при создании функции generate_minute_intervals: {e}")
+                messagebox.showerror("Ошибка", f"Ошибка при создании функции generate_minute_intervals: {e}")
+                return
             # Проверка выбранных тикеров
             if not self.marked_tickers:
                 messagebox.showwarning("Предупреждение", "Не выбрано ни одного тикера для загрузки")
@@ -1131,6 +1167,17 @@ class ByBitDownloader:
                 )
                 try:
                     await self.create_ticker_table(conn, ticker)
+                    # Считаем уже существующие минуты в базе
+                    schema = self.settings.get('Database', 'schema', fallback='public')
+                    table_name = f"klines_{ticker.lower().replace('-', '_')}"
+                    count_query = f"""
+                        SELECT COUNT(*) FROM {schema}.{table_name}
+                        WHERE timestamp >= $1 AND timestamp < $2
+                    """
+                    row = await conn.fetchrow(count_query, start_dt, end_dt)
+                    existing_minutes = row[0] if row else 0
+                    async with progress_state['lock']:
+                        progress_state['processed_minutes'] += existing_minutes
                     gaps = await self.find_data_gaps(conn, ticker, start_dt, end_dt)
                     if gaps:
                         logger.info(f"Найдено {len(gaps)} пропусков в данных для {ticker}")
@@ -1155,32 +1202,28 @@ class ByBitDownloader:
     async def find_data_gaps(self, conn, ticker, start_dt, end_dt):
         try:
             schema = self.settings.get('Database', 'schema', fallback='public')
-            # Replace hyphens with underscores in the table name
             table_name = f"klines_{ticker.lower().replace('-', '_')}"
             query = f"""
-                SELECT timestamp 
-                FROM {schema}.{table_name} 
-                WHERE timestamp >= $1 AND timestamp <= $2 
-                ORDER BY timestamp
+                SELECT minute_timestamp as timestamp
+                FROM {schema}.generate_minute_intervals($1, $2) as f
+                LEFT JOIN {schema}.{table_name} as t ON f.minute_timestamp = t.timestamp
+                WHERE t.timestamp IS NULL
+                ORDER BY minute_timestamp
             """
             rows = await conn.fetch(query, start_dt, end_dt)
-            existing_timestamps = set(row['timestamp'] for row in rows)
-            if not existing_timestamps:
-                return [(start_dt, end_dt)]
+            missing_minutes = [row['timestamp'] for row in rows]
+            if not missing_minutes:
+                return []
+            # Группируем пропущенные минуты в интервалы
             gaps = []
-            current_gap_start = None
-            current_time = start_dt
-            while current_time < end_dt:
-                if current_time not in existing_timestamps:
-                    if current_gap_start is None:
-                        current_gap_start = current_time
-                else:
-                    if current_gap_start is not None:
-                        gaps.append((current_gap_start, current_time))
-                        current_gap_start = None
-                current_time += timedelta(minutes=1)
-            if current_gap_start is not None:
-                gaps.append((current_gap_start, end_dt))
+            gap_start = missing_minutes[0]
+            prev_minute = missing_minutes[0]
+            for minute in missing_minutes[1:]:
+                if (minute - prev_minute).total_seconds() > 60:
+                    gaps.append((gap_start, prev_minute + timedelta(minutes=1)))
+                    gap_start = minute
+                prev_minute = minute
+            gaps.append((gap_start, prev_minute + timedelta(minutes=1)))
             return gaps
         except asyncio.CancelledError:
             logger.info(f"Поиск пропусков для {ticker} отменен")
