@@ -312,7 +312,8 @@ class ByBitDownloader:
                 }
             if 'Download' not in config:
                 config['Download'] = {
-                    'threads': '5'
+                    'threads': '5',
+                    'timeout': '10'
                 }
             if 'Period' not in config:
                 config['Period'] = {
@@ -333,7 +334,7 @@ class ByBitDownloader:
                 'database': 'bybit_data',
                 'schema': 'public'
             }
-            config['Download'] = {'threads': '5'}
+            config['Download'] = {'threads': '5', 'timeout': '10'}
             config['Period'] = {
                 'start_date': datetime.now().strftime("%Y-%m-%d %H:%M"),
                 'end_date': datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -357,6 +358,10 @@ class ByBitDownloader:
             if 'Logging' not in self.settings:
                 self.settings['Logging'] = {}
             self.settings['Logging']['level'] = self.log_level.get()
+            # Сохраняем таймаут
+            if 'Download' not in self.settings:
+                self.settings['Download'] = {}
+            self.settings['Download']['timeout'] = str(getattr(self, 'timeout_var', tk.StringVar(value='10')).get())
             with open('settings.ini', 'w', encoding='utf-8') as f:
                 self.settings.write(f)
             self.save_marked_tickers()
@@ -1300,55 +1305,69 @@ class ByBitDownloader:
             raise
 
     async def fetch_bybit_data(self, ticker, start_dt, end_dt):
-        try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                url = "https://api.bybit.com/v5/market/kline"
-                start_ms = int(start_dt.timestamp() * 1000)
-                end_ms = int(end_dt.timestamp() * 1000)
-                if ticker.endswith("_linear"):
-                    category = "linear"
-                    original_symbol = ticker[:-7]
-                elif ticker.endswith("_inverse"):
-                    category = "inverse"
-                    original_symbol = ticker[:-8]
-                else:
-                    category = "spot"
-                    original_symbol = ticker
-                params = {
-                    "category": category,
-                    "symbol": original_symbol,
-                    "interval": "1",
-                    "start": start_ms,
-                    "end": end_ms,
-                    "limit": 1000
-                }
-                async with session.get(url, params=params) as response:
-                    if response.status != 200:
-                        raise Exception(f"HTTP {response.status}: {await response.text()}")
-                    data = await response.json()
-                    if data.get("retCode") != 0:
-                        raise Exception(f"API ошибка: {data.get('retMsg', 'Неизвестная ошибка')}")
-                    result = data.get("result", {})
-                    klines = result.get("list", [])
-                    formatted_data = []
-                    for kline in klines:
-                        formatted_data.append({
-                            "timestamp": datetime.fromtimestamp(int(kline[0]) / 1000),
-                            "open": float(kline[1]),
-                            "high": float(kline[2]),
-                            "low": float(kline[3]),
-                            "close": float(kline[4]),
-                            "volume": float(kline[5]),
-                            "turnover": float(kline[6])
-                        })
-                    return formatted_data
-        except asyncio.CancelledError:
-            logger.info(f"Запрос для {ticker} отменен")
-            raise
-        except Exception as e:
-            logger.error(f"Ошибка при получении данных для {ticker}: {e}")
-            raise
+        import aiohttp
+        import logging
+        timeout_sec = int(self.settings.get('Download', 'timeout', fallback='10'))
+        error_logger = logging.getLogger('bybit_errors')
+        if not error_logger.handlers:
+            handler = logging.FileHandler('bybit_errors.log', encoding='utf-8')
+            handler.setLevel(logging.ERROR)
+            error_logger.addHandler(handler)
+        url = "https://api.bybit.com/v5/market/kline"
+        start_ms = int(start_dt.timestamp() * 1000)
+        end_ms = int(end_dt.timestamp() * 1000)
+        if ticker.endswith("_linear"):
+            category = "linear"
+            original_symbol = ticker[:-7]
+        elif ticker.endswith("_inverse"):
+            category = "inverse"
+            original_symbol = ticker[:-8]
+        else:
+            category = "spot"
+            original_symbol = ticker
+        params = {
+            "category": category,
+            "symbol": original_symbol,
+            "interval": "1",
+            "start": start_ms,
+            "end": end_ms,
+            "limit": 1000
+        }
+        for attempt in range(3):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, params=params, timeout=timeout_sec) as response:
+                        if response.status != 200:
+                            raise Exception(f"HTTP {response.status}: {await response.text()}")
+                        data = await response.json()
+                        if data.get("retCode") != 0:
+                            raise Exception(f"API ошибка: {data.get('retMsg', 'Неизвестная ошибка')}")
+                        result = data.get("result", {})
+                        klines = result.get("list", [])
+                        formatted_data = []
+                        for kline in klines:
+                            formatted_data.append({
+                                "timestamp": datetime.fromtimestamp(int(kline[0]) / 1000),
+                                "open": float(kline[1]),
+                                "high": float(kline[2]),
+                                "low": float(kline[3]),
+                                "close": float(kline[4]),
+                                "volume": float(kline[5]),
+                                "turnover": float(kline[6])
+                            })
+                        return formatted_data
+            except asyncio.TimeoutError:
+                logger.warning(f"Таймаут при получении данных для {ticker} за {start_dt} (попытка {attempt+1}/3)")
+                if attempt == 2:
+                    error_logger.error(f"Таймаут для {ticker} на минуте {start_dt}")
+            except Exception as e:
+                logger.warning(f"Ошибка при получении данных для {ticker} за {start_dt} (попытка {attempt+1}/3): {e}")
+                if attempt == 2:
+                    error_logger.error(f"Ошибка для {ticker} на минуте {start_dt}: {e}")
+            await asyncio.sleep(2)
+        # После 3 неудачных попыток
+        logger.error(f"Не удалось скачать данные для {ticker} на минуте {start_dt} после 3 попыток")
+        return None
 
     async def insert_data_to_db(self, conn, ticker, data):
         try:
@@ -1440,6 +1459,7 @@ class SettingsWindow:
             self.database_var = tk.StringVar(value=settings.get('Database', 'database', fallback='bybit_data'))
             self.schema_var = tk.StringVar(value=settings.get('Database', 'schema', fallback='public'))
             self.threads_var = tk.StringVar(value=settings.get('Download', 'threads', fallback='5'))
+            self.timeout_var = tk.StringVar(value=settings.get('Download', 'timeout', fallback='10'))
             
             self.setup_ui()
             
@@ -1469,14 +1489,15 @@ class SettingsWindow:
                 ("Password:", self.password_var),
                 ("Database:", self.database_var),
                 ("Schema:", self.schema_var),
-                ("Число потоков скачивания:", self.threads_var)
+                ("Число потоков скачивания:", self.threads_var),
+                ("Таймаут ответа API (сек):", self.timeout_var)
             ]
             
             for i, (label, var) in enumerate(fields):
                 frame = ttk.Frame(main_frame)
                 frame.pack(fill=tk.X, pady=2)
                 
-                ttk.Label(frame, text=label, width=20).pack(side=tk.LEFT)
+                ttk.Label(frame, text=label, width=25).pack(side=tk.LEFT)
                 
                 if label == "Password:":
                     entry = ttk.Entry(frame, textvariable=var, show="*")
@@ -1499,37 +1520,30 @@ class SettingsWindow:
     def save_settings(self):
         """Сохранение настроек"""
         try:
-            # Валидация
             port = int(self.port_var.get())
             threads = int(self.threads_var.get())
-            
+            timeout = int(self.timeout_var.get())
             if port <= 0 or port > 65535:
                 raise ValueError("Порт должен быть в диапазоне 1-65535")
-            
             if threads <= 0 or threads > 50:
                 raise ValueError("Число потоков должно быть в диапазоне 1-50")
-            
-            # Обновление настроек
+            if timeout <= 0 or timeout > 120:
+                raise ValueError("Таймаут должен быть в диапазоне 1-120 сек")
             if 'Database' not in self.settings:
                 self.settings['Database'] = {}
             if 'Download' not in self.settings:
                 self.settings['Download'] = {}
-            
             self.settings['Database']['host'] = self.host_var.get()
             self.settings['Database']['port'] = self.port_var.get()
             self.settings['Database']['user'] = self.user_var.get()
             self.settings['Database']['password'] = self.password_var.get()
             self.settings['Database']['database'] = self.database_var.get()
             self.settings['Database']['schema'] = self.schema_var.get()
-            
             self.settings['Download']['threads'] = self.threads_var.get()
-            
-            # Сохранение (пароль будет зашифрован в save_callback)
+            self.settings['Download']['timeout'] = self.timeout_var.get()
             self.save_callback()
-            
             messagebox.showinfo("Сохранение", "Настройки сохранены успешно")
             self.window.destroy()
-            
         except ValueError as e:
             messagebox.showerror("Ошибка", str(e))
         except Exception as e:
