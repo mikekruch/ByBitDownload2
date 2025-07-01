@@ -1409,20 +1409,26 @@ class ByBitDownloader:
             raise
 
     def update_progress(self, processed_tickers, total_tickers, processed_minutes, total_minutes):
+        # Защита от None
+        processed_tickers = processed_tickers or 0
+        total_tickers = total_tickers or 0
+        processed_minutes = processed_minutes or 0
+        total_minutes = total_minutes or 0
         if total_tickers > 0:
             ticker_progress = (processed_tickers / total_tickers) * 100
             minute_progress = 0
             if total_minutes > 0:
                 minute_progress = (processed_minutes / total_minutes) * 100
             overall_progress = (ticker_progress + minute_progress) / 2 if total_minutes > 0 else ticker_progress
-            self.root.after(0, lambda: self.progress_value.set(overall_progress))
-            self.root.after(0, lambda: self.status_text.set(
+            status = (
                 f"Обработано тикеров: {processed_tickers:,} / {total_tickers:,} "
                 f"({ticker_progress:.1f}%) | "
                 f"Минут: {processed_minutes:,} / {total_minutes:,} "
                 f"({minute_progress:.1f}%) | "
                 f"Общий прогресс: {overall_progress:.1f}%"
-            ).replace(",", " "))
+            )
+            self.root.after(0, lambda: self.progress_value.set(overall_progress))
+            self.root.after(0, lambda: self.status_text.set(status.replace(",", " ")))
 
     def set_log_level(self, level):
         import logging
@@ -1444,7 +1450,7 @@ class SettingsWindow:
         try:
             self.window = tk.Toplevel(parent)
             self.window.title("Настройки")
-            self.window.geometry("400x300")
+            self.window.geometry("400x400")
             self.window.resizable(False, False)
             
             self.settings = settings
