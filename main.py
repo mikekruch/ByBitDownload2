@@ -1398,12 +1398,12 @@ class ByBitDownloader:
             overall_progress = (ticker_progress + minute_progress) / 2 if total_minutes > 0 else ticker_progress
             self.root.after(0, lambda: self.progress_value.set(overall_progress))
             self.root.after(0, lambda: self.status_text.set(
-                f"Обработано тикеров: {processed_tickers}/{total_tickers} "
+                f"Обработано тикеров: {processed_tickers:,} / {total_tickers:,} "
                 f"({ticker_progress:.1f}%) | "
-                f"Минут: {processed_minutes}/{total_minutes} "
+                f"Минут: {processed_minutes:,} / {total_minutes:,} "
                 f"({minute_progress:.1f}%) | "
                 f"Общий прогресс: {overall_progress:.1f}%"
-            ))
+            ).replace(",", " "))
 
     def set_log_level(self, level):
         import logging
