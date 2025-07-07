@@ -274,6 +274,10 @@ class ByBitDownloader:
         self.download_button = ttk.Button(main_buttons_frame, text="Загрузить", command=self.start_download, style="Accent.TButton", width=20)
         self.download_button.pack(side=tk.LEFT, padx=(0, 5))
         
+        # Кнопка "Проверка" между "Загрузить" и "Прервать"
+        self.check_button = ttk.Button(main_buttons_frame, text="Проверка", command=self.check_missing_periods, width=20)
+        self.check_button.pack(side=tk.LEFT, padx=5)
+        
         self.stop_button = ttk.Button(main_buttons_frame, text="Прервать", command=self.stop_download_process, state=tk.DISABLED, width=20)
         self.stop_button.pack(side=tk.LEFT, padx=5)
         
@@ -1036,11 +1040,43 @@ class ByBitDownloader:
                 messagebox.showerror("Ошибка", "Начальная дата должна быть меньше конечной")
                 return
 
+            # --- Новый блок: корректировка start_dt для каждого тикера ---
+            import requests
+            adjusted_periods = []  # список (ticker, real_start_dt, end_dt)
+            total_minutes = 0
+            for ticker in list(self.marked_tickers):
+                # Определяем категорию и оригинальный символ
+                if ticker.endswith("_linear"):
+                    category = "linear"
+                    original_symbol = ticker[:-7]
+                elif ticker.endswith("_inverse"):
+                    category = "inverse"
+                    original_symbol = ticker[:-8]
+                else:
+                    category = "spot"
+                    original_symbol = ticker
+                # Получаем earliest timestamp через ByBit API
+                earliest_ts = self._get_earliest_timestamp_bybit(original_symbol, category)
+                if earliest_ts is None:
+                    logger.warning(f"Не удалось получить earliest timestamp для {ticker}, будет использоваться выбранная дата")
+                    real_start = start_dt
+                else:
+                    real_start = max(start_dt, earliest_ts)
+                if real_start >= end_dt:
+                    logger.info(f"Для {ticker} нет данных для скачивания в выбранном периоде")
+                    continue
+                adjusted_periods.append((ticker, real_start, end_dt))
+                total_minutes += int((end_dt - real_start).total_seconds() / 60)
+            if not adjusted_periods:
+                messagebox.showinfo("Нет данных", "Нет тикеров с доступными данными для скачивания в выбранном периоде.")
+                return
+            # --- Конец нового блока ---
+
             # Запуск загрузки в отдельном потоке - только помеченные тикеры
             self.stop_download = False
             self.download_thread = threading.Thread(
                 target=self.download_process,
-                args=(start_dt, end_dt, list(self.marked_tickers))
+                args=(adjusted_periods, total_minutes),
             )
             self.download_thread.daemon = True
             self.download_thread.start()
@@ -1049,13 +1085,60 @@ class ByBitDownloader:
             self.download_button.config(state=tk.DISABLED)
             self.stop_button.config(state=tk.NORMAL)
             self.progress_value.set(0)
-            self.status_text.set(f"Начало загрузки {len(self.marked_tickers)} помеченных тикеров...")
+            self.status_text.set(f"Начало загрузки {len(adjusted_periods)} тикеров...")
 
         except Exception as e:
             error_msg = f"Ошибка при запуске загрузки: {e}"
             logger.error(error_msg)
             messagebox.showerror("Ошибка", error_msg)
             self.finish_download()
+
+    def download_process(self, adjusted_periods, total_minutes):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(self.async_download(adjusted_periods, total_minutes))
+            loop.close()
+        except Exception as e:
+            logger.error(f"Ошибка в процессе загрузки: {e}")
+            self.root.after(0, lambda: self.status_text.set(f"Ошибка загрузки: {e}"))
+        finally:
+            self.root.after(0, self.finish_download)
+
+    async def async_download(self, adjusted_periods, total_minutes):
+        try:
+            progress_state = {
+                'processed_tickers': 0,
+                'processed_minutes': 0,
+                'lock': asyncio.Lock()
+            }
+            max_connections = int(self.settings.get('Download', 'threads', fallback='5'))
+            semaphore = asyncio.Semaphore(max_connections)
+            progress_task = asyncio.create_task(
+                self.progress_updater(progress_state, len(adjusted_periods), total_minutes)
+            )
+            tasks = []
+            for ticker, real_start, real_end in adjusted_periods:
+                if self.stop_download:
+                    break
+                task = asyncio.create_task(
+                    self.download_ticker_data(ticker, real_start, real_end, semaphore, progress_state)
+                )
+                tasks.append(task)
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Асинхронная загрузка завершена")
+        except asyncio.CancelledError:
+            logger.info("Асинхронная загрузка отменена")
+            raise
+        except Exception as e:
+            logger.error(f"Ошибка в асинхронной загрузке: {e}")
+            raise
 
     def stop_download_process(self):
         try:
@@ -1078,18 +1161,6 @@ class ByBitDownloader:
         except Exception as e:
             logger.error(f"Ошибка в главном цикле приложения: {e}")
 
-    def download_process(self, start_dt, end_dt, tickers):
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(self.async_download(start_dt, end_dt, tickers))
-            loop.close()
-        except Exception as e:
-            logger.error(f"Ошибка в процессе загрузки: {e}")
-            self.root.after(0, lambda: self.status_text.set(f"Ошибка загрузки: {e}"))
-        finally:
-            self.root.after(0, self.finish_download)
-
     def finish_download(self):
         try:
             self.download_button.config(state=tk.NORMAL)
@@ -1103,42 +1174,6 @@ class ByBitDownloader:
                 logger.info("Загрузка завершена успешно")
         except Exception as e:
             logger.error(f"Ошибка при завершении загрузки: {e}")
-
-    async def async_download(self, start_dt, end_dt, tickers):
-        try:
-            progress_state = {
-                'processed_tickers': 0,
-                'processed_minutes': 0,
-                'lock': asyncio.Lock()
-            }
-            total_minutes = int((end_dt - start_dt).total_seconds() / 60) * len(tickers)
-            max_connections = int(self.settings.get('Download', 'threads', fallback='5'))
-            semaphore = asyncio.Semaphore(max_connections)
-            progress_task = asyncio.create_task(
-                self.progress_updater(progress_state, len(tickers), total_minutes)
-            )
-            tasks = []
-            for ticker in tickers:
-                if self.stop_download:
-                    break
-                task = asyncio.create_task(
-                    self.download_ticker_data(ticker, start_dt, end_dt, semaphore, progress_state)
-                )
-                tasks.append(task)
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            progress_task.cancel()
-            try:
-                await progress_task
-            except asyncio.CancelledError:
-                pass
-            logger.info("Асинхронная загрузка завершена")
-        except asyncio.CancelledError:
-            logger.info("Асинхронная загрузка отменена")
-            raise
-        except Exception as e:
-            logger.error(f"Ошибка в асинхронной загрузке: {e}")
-            raise
 
     async def progress_updater(self, progress_state, total_tickers, total_minutes):
         try:
@@ -1443,6 +1478,134 @@ class ByBitDownloader:
                 root_logger.setLevel(logging.WARNING)
             elif level == "ERROR":
                 root_logger.setLevel(logging.ERROR)
+
+    def check_missing_periods(self):
+        """Проверка пропущенных свечей по выделенным тикерам и формирование отчета"""
+        try:
+            if not self.marked_tickers:
+                messagebox.showwarning("Проверка", "Не выбрано ни одного тикера для проверки.")
+                return
+            # Парсинг дат
+            try:
+                start_dt = datetime.strptime(self.start_date.get(), "%Y-%m-%d %H:%M")
+                end_dt = datetime.strptime(self.end_date.get(), "%Y-%m-%d %H:%M")
+            except ValueError:
+                messagebox.showerror("Ошибка", "Неверный формат даты. Используйте формат: YYYY-MM-DD HH:MM")
+                return
+            if start_dt >= end_dt:
+                messagebox.showerror("Ошибка", "Начальная дата должна быть меньше конечной")
+                return
+            # Запуск проверки в отдельном потоке, чтобы не блокировать UI
+            threading.Thread(target=self._check_missing_periods_thread, args=(start_dt, end_dt, list(self.marked_tickers)), daemon=True).start()
+        except Exception as e:
+            logger.error(f"Ошибка при запуске проверки пропущенных свечей: {e}")
+            messagebox.showerror("Ошибка", f"Ошибка при запуске проверки: {e}")
+
+    def _check_missing_periods_thread(self, start_dt, end_dt, tickers):
+        try:
+            self.status_text.set("Проверка пропущенных свечей...")
+            self.root.after(0, self.progress_bar.start)
+            import requests
+            import psycopg2
+            from collections import defaultdict
+            report = []
+            # Подключение к базе
+            conn = psycopg2.connect(
+                host=self.settings.get('Database', 'host'),
+                port=self.settings.get('Database', 'port'),
+                user=self.settings.get('Database', 'user'),
+                password=self.crypto_manager.decrypt(self.settings.get('Database', 'password').replace('encrypted:', '')),
+                database=self.settings.get('Database', 'database')
+            )
+            schema = self.settings.get('Database', 'schema', fallback='public')
+            for ticker in sorted(tickers):
+                # Определяем категорию и оригинальный символ
+                if ticker.endswith("_linear"):
+                    category = "linear"
+                    original_symbol = ticker[:-7]
+                elif ticker.endswith("_inverse"):
+                    category = "inverse"
+                    original_symbol = ticker[:-8]
+                else:
+                    category = "spot"
+                    original_symbol = ticker
+                # Получаем earliest timestamp через ByBit API
+                earliest_ts = self._get_earliest_timestamp_bybit(original_symbol, category)
+                if earliest_ts is None:
+                    logger.warning(f"Не удалось получить earliest timestamp для {ticker}")
+                    continue
+                # Если earliest позже выбранного периода, пропускаем
+                if earliest_ts > end_dt:
+                    continue
+                period_start = max(start_dt, earliest_ts)
+                # Получаем все минуты периода
+                minutes = []
+                cur = conn.cursor()
+                cur.execute(f"SELECT minute_timestamp FROM {schema}.generate_minute_intervals(%s, %s)", (period_start, end_dt))
+                minutes = [row[0] for row in cur.fetchall()]
+                # Получаем существующие свечи
+                table_name = f"klines_{ticker.lower().replace('-', '_')}"
+                cur.execute(f"SELECT timestamp FROM {schema}.{table_name} WHERE timestamp >= %s AND timestamp < %s", (period_start, end_dt))
+                existing = set(row[0] for row in cur.fetchall())
+                # Пропущенные минуты
+                missing = sorted([m for m in minutes if m not in existing])
+                # Группируем пропущенные минуты в интервалы
+                if missing:
+                    interval_start = missing[0]
+                    interval_end = missing[0]
+                    for m in missing[1:]:
+                        if (m - interval_end).total_seconds() == 60:
+                            interval_end = m
+                        else:
+                            report.append((ticker, interval_start, interval_end))
+                            interval_start = m
+                            interval_end = m
+                    report.append((ticker, interval_start, interval_end))
+                cur.close()
+            conn.close()
+            # Сортировка отчета
+            report.sort(key=lambda x: (x[0], x[1]))
+            # Запись в файл
+            report_path = os.path.abspath("bybit_missing_report.txt")
+            with open(report_path, "w", encoding="utf-8") as f:
+                f.write("Тикер\tНачальная свеча\tКонечная свеча\n")
+                for ticker, ts_start, ts_end in report:
+                    f.write(f"{ticker}\t{ts_start.strftime('%Y-%m-%d %H:%M')}\t{ts_end.strftime('%Y-%m-%d %H:%M')}\n")
+            self.status_text.set(f"Проверка завершена. Найдено пропущенных интервалов: {len(report)}")
+            logger.info(f"Проверка завершена. Отчет: {report_path}")
+            # Открыть файл
+            os.startfile(report_path)
+        except Exception as e:
+            logger.error(f"Ошибка при проверке пропущенных свечей: {e}")
+            self.status_text.set(f"Ошибка проверки: {e}")
+        finally:
+            self.root.after(0, self.progress_bar.stop)
+
+    def _get_earliest_timestamp_bybit(self, symbol, category):
+        """Получить самый ранний timestamp для тикера через ByBit API"""
+        try:
+            import requests
+            url = "https://api.bybit.com/v5/market/kline"
+            params = {
+                "category": category,
+                "symbol": symbol,
+                "interval": "1",
+                "from": 1262304000,  # 2010-01-01
+                "limit": 1
+            }
+            resp = requests.get(url, params=params, timeout=15)
+            data = resp.json()
+            if data.get("retCode") != 0:
+                return None
+            result = data.get("result", {})
+            klines = result.get("list", [])
+            if not klines:
+                return None
+            ts = int(klines[0][0]) // 1000  # ms to s
+            return datetime.fromtimestamp(ts)
+        except Exception as e:
+            logger.warning(f"_get_earliest_timestamp_bybit: {symbol} {category}: {e}")
+            return None
 
 
 class SettingsWindow:
