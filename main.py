@@ -1005,6 +1005,14 @@ class ByBitDownloader:
                 END;
                 $$ LANGUAGE plpgsql;
             """
+            # Создание таблицы earliest_timestamp
+            create_earliest_table = f"""
+                CREATE TABLE IF NOT EXISTS {schema}.earliest_timestamp (
+                    ticker TEXT PRIMARY KEY,
+                    date DATE NOT NULL,
+                    earliest_ts TIMESTAMP NOT NULL
+                );
+            """
             try:
                 conn = psycopg2.connect(
                     host=self.settings.get('Database', 'host'),
@@ -1016,11 +1024,12 @@ class ByBitDownloader:
                 conn.autocommit = True
                 with conn.cursor() as cur:
                     cur.execute(query)
+                    cur.execute(create_earliest_table)
                 conn.close()
-                logger.info("Функция generate_minute_intervals успешно создана/обновлена в базе данных")
+                logger.info("Функции и таблицы успешно созданы/обновлены в базе данных")
             except Exception as e:
-                logger.error(f"Ошибка при создании функции generate_minute_intervals: {e}")
-                messagebox.showerror("Ошибка", f"Ошибка при создании функции generate_minute_intervals: {e}")
+                logger.error(f"Ошибка при создании функции или таблицы: {e}")
+                messagebox.showerror("Ошибка", f"Ошибка при создании функции или таблицы: {e}")
                 return
             # Проверка выбранных тикеров
             if not self.marked_tickers:
@@ -1042,9 +1051,22 @@ class ByBitDownloader:
 
             # --- Новый блок: корректировка start_dt для каждого тикера ---
             import requests
+            import psycopg2
             adjusted_periods = []  # список (ticker, real_start_dt, end_dt)
             total_minutes = 0
-            for ticker in list(self.marked_tickers):
+            marked_count = len(self.marked_tickers)
+            today = datetime.now().date()
+            yesterday = today - timedelta(days=1)
+            # Подключение к базе для earliest_timestamp
+            conn = psycopg2.connect(
+                host=self.settings.get('Database', 'host'),
+                port=self.settings.get('Database', 'port'),
+                user=self.settings.get('Database', 'user'),
+                password=self.crypto_manager.decrypt(self.settings.get('Database', 'password').replace('encrypted:', '')),
+                database=self.settings.get('Database', 'database')
+            )
+            conn.autocommit = True
+            for idx, ticker in enumerate(list(self.marked_tickers), 1):
                 # Определяем категорию и оригинальный символ
                 if ticker.endswith("_linear"):
                     category = "linear"
@@ -1055,11 +1077,34 @@ class ByBitDownloader:
                 else:
                     category = "spot"
                     original_symbol = ticker
-                # Получаем earliest timestamp через ByBit API
-                earliest_ts = self._get_earliest_timestamp_bybit(original_symbol, category)
-                if earliest_ts is None:
-                    logger.warning(f"Не удалось получить earliest timestamp для {ticker}, будет использоваться выбранная дата")
-                    real_start = start_dt
+                # Проверяем earliest_timestamp в базе
+                with conn.cursor() as cur:
+                    cur.execute(f"SELECT earliest_ts, date FROM {schema}.earliest_timestamp WHERE ticker = %s", (ticker,))
+                    row = cur.fetchone()
+                    use_db = False
+                    if row:
+                        db_earliest, db_date = row
+                        if db_date >= yesterday:
+                            earliest_ts = db_earliest
+                            use_db = True
+                        else:
+                            earliest_ts = None
+                    else:
+                        earliest_ts = None
+                if not use_db:
+                    # Получаем earliest timestamp через ByBit API
+                    api_earliest = self._get_earliest_timestamp_bybit(original_symbol, category)
+                    if api_earliest is None:
+                        logger.warning(f"Не удалось получить earliest timestamp для {ticker}, будет использоваться выбранная дата")
+                        real_start = start_dt
+                    else:
+                        earliest_ts = api_earliest
+                        # Записываем/обновляем в базе
+                        with conn.cursor() as cur:
+                            cur.execute(f"INSERT INTO {schema}.earliest_timestamp (ticker, date, earliest_ts) VALUES (%s, %s, %s) "
+                                        f"ON CONFLICT (ticker) DO UPDATE SET date = EXCLUDED.date, earliest_ts = EXCLUDED.earliest_ts",
+                                        (ticker, today, earliest_ts))
+                        real_start = max(start_dt, earliest_ts)
                 else:
                     real_start = max(start_dt, earliest_ts)
                 if real_start >= end_dt:
@@ -1067,6 +1112,10 @@ class ByBitDownloader:
                     continue
                 adjusted_periods.append((ticker, real_start, end_dt))
                 total_minutes += int((end_dt - real_start).total_seconds() / 60)
+                # Обновляем строку состояния
+                self.status_text.set(f"Определено первых свечей для {idx} из {marked_count} тикеров...")
+                self.root.update_idletasks()
+            conn.close()
             if not adjusted_periods:
                 messagebox.showinfo("Нет данных", "Нет тикеров с доступными данными для скачивания в выбранном периоде.")
                 return
