@@ -1049,15 +1049,23 @@ class ByBitDownloader:
                 messagebox.showerror("Ошибка", "Начальная дата должна быть меньше конечной")
                 return
 
-            # --- Новый блок: корректировка start_dt для каждого тикера ---
+            # Запуск расчета earliest timestamp в отдельном потоке
+            threading.Thread(target=self._prepare_and_start_download, args=(start_dt, end_dt), daemon=True).start()
+        except Exception as e:
+            error_msg = f"Ошибка при запуске загрузки: {e}"
+            logger.error(error_msg)
+            messagebox.showerror("Ошибка", error_msg)
+            self.finish_download()
+
+    def _prepare_and_start_download(self, start_dt, end_dt):
+        try:
             import requests
-            import psycopg2
-            adjusted_periods = []  # список (ticker, real_start_dt, end_dt)
+            schema = self.settings.get('Database', 'schema', fallback='public')
+            adjusted_periods = []
             total_minutes = 0
             marked_count = len(self.marked_tickers)
             today = datetime.now().date()
             yesterday = today - timedelta(days=1)
-            # Подключение к базе для earliest_timestamp
             conn = psycopg2.connect(
                 host=self.settings.get('Database', 'host'),
                 port=self.settings.get('Database', 'port'),
@@ -1067,7 +1075,6 @@ class ByBitDownloader:
             )
             conn.autocommit = True
             for idx, ticker in enumerate(list(self.marked_tickers), 1):
-                # Определяем категорию и оригинальный символ
                 if ticker.endswith("_linear"):
                     category = "linear"
                     original_symbol = ticker[:-7]
@@ -1077,7 +1084,6 @@ class ByBitDownloader:
                 else:
                     category = "spot"
                     original_symbol = ticker
-                # Проверяем earliest_timestamp в базе
                 with conn.cursor() as cur:
                     cur.execute(f"SELECT earliest_ts, date FROM {schema}.earliest_timestamp WHERE ticker = %s", (ticker,))
                     row = cur.fetchone()
@@ -1092,14 +1098,12 @@ class ByBitDownloader:
                     else:
                         earliest_ts = None
                 if not use_db:
-                    # Получаем earliest timestamp через ByBit API
                     api_earliest = self._get_earliest_timestamp_bybit(original_symbol, category)
                     if api_earliest is None:
                         logger.warning(f"Не удалось получить earliest timestamp для {ticker}, будет использоваться выбранная дата")
                         real_start = start_dt
                     else:
                         earliest_ts = api_earliest
-                        # Записываем/обновляем в базе
                         with conn.cursor() as cur:
                             cur.execute(f"INSERT INTO {schema}.earliest_timestamp (ticker, date, earliest_ts) VALUES (%s, %s, %s) "
                                         f"ON CONFLICT (ticker) DO UPDATE SET date = EXCLUDED.date, earliest_ts = EXCLUDED.earliest_ts",
@@ -1112,16 +1116,17 @@ class ByBitDownloader:
                     continue
                 adjusted_periods.append((ticker, real_start, end_dt))
                 total_minutes += int((end_dt - real_start).total_seconds() / 60)
-                # Обновляем строку состояния
-                self.status_text.set(f"Определено первых свечей для {idx} из {marked_count} тикеров...")
-                self.root.update_idletasks()
+                # Обновляем строку состояния из потока
+                self.root.after(0, lambda idx=idx, marked_count=marked_count: self.status_text.set(f"Определено первых свечей для {idx} из {marked_count} тикеров..."))
+                self.root.after(0, self.root.update_idletasks)
             conn.close()
+            # После завершения — явно обновить строку состояния
+            self.root.after(0, lambda: self.status_text.set(f"Определено первых свечей для {marked_count} из {marked_count} тикеров."))
+            self.root.after(0, self.root.update_idletasks)
             if not adjusted_periods:
-                messagebox.showinfo("Нет данных", "Нет тикеров с доступными данными для скачивания в выбранном периоде.")
+                self.root.after(0, lambda: messagebox.showinfo("Нет данных", "Нет тикеров с доступными данными для скачивания в выбранном периоде."))
                 return
-            # --- Конец нового блока ---
-
-            # Запуск загрузки в отдельном потоке - только помеченные тикеры
+            # Запуск загрузки в отдельном потоке
             self.stop_download = False
             self.download_thread = threading.Thread(
                 target=self.download_process,
@@ -1129,18 +1134,16 @@ class ByBitDownloader:
             )
             self.download_thread.daemon = True
             self.download_thread.start()
-
             # Обновление UI
-            self.download_button.config(state=tk.DISABLED)
-            self.stop_button.config(state=tk.NORMAL)
-            self.progress_value.set(0)
-            self.status_text.set(f"Начало загрузки {len(adjusted_periods)} тикеров...")
-
+            self.root.after(0, lambda: self.download_button.config(state=tk.DISABLED))
+            self.root.after(0, lambda: self.stop_button.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.progress_value.set(0))
+            self.root.after(0, lambda: self.status_text.set(f"Начало загрузки {len(adjusted_periods)} тикеров..."))
         except Exception as e:
-            error_msg = f"Ошибка при запуске загрузки: {e}"
+            error_msg = f"Ошибка при подготовке к загрузке: {e}"
             logger.error(error_msg)
-            messagebox.showerror("Ошибка", error_msg)
-            self.finish_download()
+            self.root.after(0, lambda: messagebox.showerror("Ошибка", error_msg))
+            self.root.after(0, self.finish_download)
 
     def download_process(self, adjusted_periods, total_minutes):
         try:
@@ -1631,30 +1634,116 @@ class ByBitDownloader:
             self.root.after(0, self.progress_bar.stop)
 
     def _get_earliest_timestamp_bybit(self, symbol, category):
-        """Получить самый ранний timestamp для тикера через ByBit API"""
-        try:
-            import requests
-            url = "https://api.bybit.com/v5/market/kline"
+        """Получить самый ранний timestamp для тикера через ByBit API (поиск по месяцам, дням, часам, минутам)"""
+        import requests
+        from datetime import datetime, timedelta
+        import time as time_mod
+        url = "https://api.bybit.com/v5/market/kline"
+        interval = "1"
+        # 1. Поиск earliest месяца
+        # Начинаем с 2010-01-01
+        t = datetime(2010, 1, 1)
+        now = datetime.now(datetime.timezone.utc)
+        found = None
+        # Поиск по месяцам
+        while t < now:
             params = {
                 "category": category,
                 "symbol": symbol,
-                "interval": "1",
-                "from": 1262304000,  # 2010-01-01
+                "interval": interval,
+                "from": int(t.timestamp()),
                 "limit": 1
             }
-            resp = requests.get(url, params=params, timeout=15)
-            data = resp.json()
-            if data.get("retCode") != 0:
+            try:
+                resp = requests.get(url, params=params, timeout=10)
+                data = resp.json()
+                if data.get("retCode") != 0:
+                    return None
+                klines = data.get("result", {}).get("list", [])
+                if klines:
+                    found = int(klines[-1][0]) // 1000
+                    break
+            except Exception as e:
+                logger.warning(f"Ошибка поиска earliest месяца: {e}")
                 return None
-            result = data.get("result", {})
-            klines = result.get("list", [])
-            if not klines:
-                return None
-            ts = int(klines[0][0]) // 1000  # ms to s
-            return datetime.fromtimestamp(ts)
-        except Exception as e:
-            logger.warning(f"_get_earliest_timestamp_bybit: {symbol} {category}: {e}")
+            # Следующий месяц
+            t = (t.replace(day=1) + timedelta(days=32)).replace(day=1)
+        if not found:
             return None
+        # 2. Поиск earliest дня в найденном месяце
+        t = datetime.fromtimestamp(found, tz=datetime.timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        while t < now:
+            params = {
+                "category": category,
+                "symbol": symbol,
+                "interval": interval,
+                "from": int(t.timestamp()),
+                "limit": 1
+            }
+            try:
+                resp = requests.get(url, params=params, timeout=10)
+                data = resp.json()
+                if data.get("retCode") != 0:
+                    return None
+                klines = data.get("result", {}).get("list", [])
+                if klines:
+                    found = int(klines[-1][0]) // 1000
+                    break
+            except Exception as e:
+                logger.warning(f"Ошибка поиска earliest дня: {e}")
+                return None
+            t += timedelta(days=1)
+        # 3. Поиск earliest часа в найденном дне
+        t = datetime.fromtimestamp(found, tz=datetime.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        for h in range(24):
+            t_h = t.replace(hour=h)
+            if t_h > now:
+                break
+            params = {
+                "category": category,
+                "symbol": symbol,
+                "interval": interval,
+                "from": int(t_h.timestamp()),
+                "limit": 1
+            }
+            try:
+                resp = requests.get(url, params=params, timeout=10)
+                data = resp.json()
+                if data.get("retCode") != 0:
+                    return None
+                klines = data.get("result", {}).get("list", [])
+                if klines:
+                    found = int(klines[-1][0]) // 1000
+                    break
+            except Exception as e:
+                logger.warning(f"Ошибка поиска earliest часа: {e}")
+                return None
+        # 4. Поиск earliest минуты в найденном часе
+        t = datetime.fromtimestamp(found, tz=datetime.timezone.utc).replace(second=0, microsecond=0)
+        for m in range(60):
+            t_m = t.replace(minute=m)
+            if t_m > now:
+                break
+            params = {
+                "category": category,
+                "symbol": symbol,
+                "interval": interval,
+                "from": int(t_m.timestamp()),
+                "limit": 1
+            }
+            try:
+                resp = requests.get(url, params=params, timeout=10)
+                data = resp.json()
+                if data.get("retCode") != 0:
+                    return None
+                klines = data.get("result", {}).get("list", [])
+                if klines:
+                    found = int(klines[-1][0]) // 1000
+                    break
+            except Exception as e:
+                logger.warning(f"Ошибка поиска earliest минуты: {e}")
+                return None
+        return datetime.fromtimestamp(found, tz=datetime.timezone.utc)
 
 
 class SettingsWindow:
