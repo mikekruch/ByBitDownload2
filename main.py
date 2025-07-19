@@ -8,7 +8,7 @@ import os
 import threading
 import time
 import signal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 import logging
 import base64
@@ -1642,8 +1642,8 @@ class ByBitDownloader:
         interval = "1"
         # 1. Поиск earliest месяца
         # Начинаем с 2010-01-01
-        t = datetime(2010, 1, 1)
-        now = datetime.now(datetime.timezone.utc)
+        t = datetime(2010, 1, 1, tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
         found = None
         # Поиск по месяцам
         while t < now:
@@ -1667,11 +1667,11 @@ class ByBitDownloader:
                 logger.warning(f"Ошибка поиска earliest месяца: {e}")
                 return None
             # Следующий месяц
-            t = (t.replace(day=1) + timedelta(days=32)).replace(day=1)
+            t = (t.replace(day=1) + timedelta(days=32)).replace(day=1, tzinfo=timezone.utc)
         if not found:
             return None
         # 2. Поиск earliest дня в найденном месяце
-        t = datetime.fromtimestamp(found, tz=datetime.timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        t = datetime.fromtimestamp(found, tz=timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
         while t < now:
             params = {
                 "category": category,
@@ -1694,7 +1694,7 @@ class ByBitDownloader:
                 return None
             t += timedelta(days=1)
         # 3. Поиск earliest часа в найденном дне
-        t = datetime.fromtimestamp(found, tz=datetime.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        t = datetime.fromtimestamp(found, tz=timezone.utc).replace(minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
         for h in range(24):
             t_h = t.replace(hour=h)
             if t_h > now:
@@ -1719,7 +1719,7 @@ class ByBitDownloader:
                 logger.warning(f"Ошибка поиска earliest часа: {e}")
                 return None
         # 4. Поиск earliest минуты в найденном часе
-        t = datetime.fromtimestamp(found, tz=datetime.timezone.utc).replace(second=0, microsecond=0)
+        t = datetime.fromtimestamp(found, tz=timezone.utc).replace(second=0, microsecond=0, tzinfo=timezone.utc)
         for m in range(60):
             t_m = t.replace(minute=m)
             if t_m > now:
@@ -1743,7 +1743,7 @@ class ByBitDownloader:
             except Exception as e:
                 logger.warning(f"Ошибка поиска earliest минуты: {e}")
                 return None
-        return datetime.fromtimestamp(found, tz=datetime.timezone.utc)
+        return datetime.fromtimestamp(found, tz=timezone.utc)
 
 
 class SettingsWindow:
