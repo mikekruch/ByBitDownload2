@@ -1634,24 +1634,25 @@ class ByBitDownloader:
             self.root.after(0, self.progress_bar.stop)
 
     def _get_earliest_timestamp_bybit(self, symbol, category):
-        """Получить самый ранний timestamp для тикера через ByBit API (поиск по месяцам, дням, часам, минутам)"""
+        """Бинарный поиск самой ранней минутной свечи через ByBit API (interval=1)"""
         import requests
-        from datetime import datetime, timedelta
-        import time as time_mod
+        from datetime import datetime, timedelta, timezone
         url = "https://api.bybit.com/v5/market/kline"
-        interval = "1"
-        # 1. Поиск earliest месяца
-        # Начинаем с 2010-01-01
-        t = datetime(2010, 1, 1, tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        found = None
-        # Поиск по месяцам
-        while t < now:
+        # Диапазон поиска: с 2020-01-01 до сейчас (оба timezone-aware)
+        left_dt = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        right_dt = datetime.now(timezone.utc)
+        left = int(left_dt.timestamp())
+        right = int(right_dt.timestamp())
+        earliest = None
+        while left <= right:
+            mid = (left + right) // 2
+            mid_dt = datetime.fromtimestamp(mid, tz=timezone.utc)
             params = {
                 "category": category,
                 "symbol": symbol,
-                "interval": interval,
-                "from": int(t.timestamp()),
+                "interval": "1",
+                "start": int(mid_dt.timestamp() * 1000),
+                "end": int((mid_dt + timedelta(seconds=60)).timestamp() * 1000),
                 "limit": 1
             }
             try:
@@ -1661,89 +1662,19 @@ class ByBitDownloader:
                     return None
                 klines = data.get("result", {}).get("list", [])
                 if klines:
-                    found = int(klines[-1][0]) // 1000
-                    break
+                    # Есть свеча — ищем раньше
+                    ts = int(klines[-1][0]) // 1000
+                    earliest = ts
+                    right = mid - 1
+                else:
+                    # Нет свечи — ищем позже
+                    left = mid + 1
             except Exception as e:
-                logger.warning(f"Ошибка поиска earliest месяца: {e}")
+                logger.warning(f"Ошибка бинарного поиска earliest минуты: {e}")
                 return None
-            # Следующий месяц
-            t = (t.replace(day=1) + timedelta(days=32)).replace(day=1, tzinfo=timezone.utc)
-        if not found:
-            return None
-        # 2. Поиск earliest дня в найденном месяце
-        t = datetime.fromtimestamp(found, tz=timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        while t < now:
-            params = {
-                "category": category,
-                "symbol": symbol,
-                "interval": interval,
-                "from": int(t.timestamp()),
-                "limit": 1
-            }
-            try:
-                resp = requests.get(url, params=params, timeout=10)
-                data = resp.json()
-                if data.get("retCode") != 0:
-                    return None
-                klines = data.get("result", {}).get("list", [])
-                if klines:
-                    found = int(klines[-1][0]) // 1000
-                    break
-            except Exception as e:
-                logger.warning(f"Ошибка поиска earliest дня: {e}")
-                return None
-            t += timedelta(days=1)
-        # 3. Поиск earliest часа в найденном дне
-        t = datetime.fromtimestamp(found, tz=timezone.utc).replace(minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        for h in range(24):
-            t_h = t.replace(hour=h)
-            if t_h > now:
-                break
-            params = {
-                "category": category,
-                "symbol": symbol,
-                "interval": interval,
-                "from": int(t_h.timestamp()),
-                "limit": 1
-            }
-            try:
-                resp = requests.get(url, params=params, timeout=10)
-                data = resp.json()
-                if data.get("retCode") != 0:
-                    return None
-                klines = data.get("result", {}).get("list", [])
-                if klines:
-                    found = int(klines[-1][0]) // 1000
-                    break
-            except Exception as e:
-                logger.warning(f"Ошибка поиска earliest часа: {e}")
-                return None
-        # 4. Поиск earliest минуты в найденном часе
-        t = datetime.fromtimestamp(found, tz=timezone.utc).replace(second=0, microsecond=0, tzinfo=timezone.utc)
-        for m in range(60):
-            t_m = t.replace(minute=m)
-            if t_m > now:
-                break
-            params = {
-                "category": category,
-                "symbol": symbol,
-                "interval": interval,
-                "from": int(t_m.timestamp()),
-                "limit": 1
-            }
-            try:
-                resp = requests.get(url, params=params, timeout=10)
-                data = resp.json()
-                if data.get("retCode") != 0:
-                    return None
-                klines = data.get("result", {}).get("list", [])
-                if klines:
-                    found = int(klines[-1][0]) // 1000
-                    break
-            except Exception as e:
-                logger.warning(f"Ошибка поиска earliest минуты: {e}")
-                return None
-        return datetime.fromtimestamp(found, tz=timezone.utc)
+        if earliest:
+            return datetime.fromtimestamp(earliest, tz=timezone.utc)
+        return None
 
 
 class SettingsWindow:
